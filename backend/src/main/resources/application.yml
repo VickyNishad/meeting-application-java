@@ -14,9 +14,6 @@ spring:
       connection-timeout: 5000
       max-lifetime: 1800000
       data-source-properties:
-        # Keep personal data out of logs and exception messages: without this, pgjdbc echoes the server's
-        # "Detail: Key (...)=(...)" and, for batched statements, the INSERT with all bound values (e.g. invitee
-        # name/e-mail) whenever a statement fails. The SQLSTATE and constraint name are still reported.
         logServerErrorDetail: false
   jpa:
     open-in-view: false
@@ -61,8 +58,6 @@ spring:
     error:
       include-message: never
       include-stacktrace: never
-  # Social login: set the provider variables (see .env.example) and activate the "oauth" profile, which adds
-  # spring.security.oauth2.client.registration.{google,microsoft}. Without it, OAuth2 login is disabled.
 
 server:
   port: ${PORT:8080}
@@ -88,7 +83,6 @@ management:
   metrics:
     tags:
       application: meet-platform
-  # Metrics are scraped by Prometheus; OTLP is used for traces only.
   otlp:
     metrics:
       export:
@@ -107,7 +101,6 @@ springdoc:
     enabled: ${APP_OPENAPI_ENABLED:false}
   swagger-ui:
     enabled: ${APP_OPENAPI_ENABLED:false}
-    # keep the access token across page reloads while exploring the API
     persist-authorization: true
     tags-sorter: alpha
     operations-sorter: method
@@ -129,7 +122,6 @@ app:
     refresh-token-ttl: 30d
     cookie-secure: ${APP_COOKIE_SECURE:true}
     issuer: ${APP_JWT_ISSUER:meet-platform}
-    # /actuator/prometheus requires HTTP Basic "prometheus:<this password>"; empty = the endpoint is closed.
     metrics-scrape-password: ${APP_METRICS_SCRAPE_PASSWORD:}
   auth:
     require-email-verification: ${APP_REQUIRE_EMAIL_VERIFICATION:true}
@@ -154,28 +146,21 @@ app:
     recordings-bucket: ${S3_RECORDINGS_BUCKET:meet-recordings}
     files-bucket: ${S3_FILES_BUCKET:meet-files}
     presign-ttl: 15m
-    # s3 = S3/MinIO (uat, prod); local = files on this machine's disk under local-root (dev profile)
     type: ${APP_STORAGE_TYPE:s3}
     local-root: ${APP_STORAGE_LOCAL_ROOT:}
   recording:
     default-retention-days: ${APP_RECORDING_RETENTION_DAYS:90}
     file-prefix: recordings
-  # Speaking clips: one .webm per participant per speaking turn, recorded by the participant's browser and filed under
-  # <storage-path>/DD-MM-YYYY/<Meeting_Title>/<Participant_Name>/DDMMYYHHmmss_<id>.webm (README-Docker.md, docs).
   speech-recordings:
     storage-path: ${RECORDING_STORAGE_PATH:./data/Recordings}
-    # New clips and chunks are refused (507) when less than this is free on that disk.
     min-free-bytes: ${RECORDING_MIN_FREE_BYTES:209715200}
     max-chunk-bytes: 8388608
     max-clip-bytes: 524288000
     access-url-ttl: PT10M
-    # A clip with no chunk for this long is closed as INCOMPLETE (browser gone, or a restart while recording).
     stale-after: PT2M
     recovery-interval: PT1M
   rate-limit:
     enabled: ${APP_RATE_LIMIT_ENABLED:true}
-  # Shared state between API instances: per-room signal numbers and scheduled-job locks.
-  # redis (default; several instances) or memory (a single instance without Redis).
   coordination:
     store: ${APP_COORDINATION_STORE:redis}
   notifications:
@@ -192,9 +177,7 @@ app:
       application/vnd.openxmlformats-officedocument.presentationml.presentation,
       application/zip
   calendar:
-    # 32 random bytes, Base64 (openssl rand -base64 32). Required to store calendar OAuth tokens.
     encryption-key: ${APP_CALENDAR_ENCRYPTION_KEY:}
-    # Public base URL that reaches this API (used for the OAuth redirect URI); defaults to app.public-url.
     callback-base-url: ${APP_CALENDAR_CALLBACK_BASE_URL:}
     google:
       client-id: ${GOOGLE_CALENDAR_CLIENT_ID:}
@@ -206,10 +189,6 @@ app:
   meetings:
     default-max-participants: 100
     hard-max-participants: 300
-    # A host whose connection drops gets a successor only if they have not reconnected within this time.
     host-dropout-grace: ${APP_HOST_DROPOUT_GRACE:PT20S}
-    # Joins and leaves within this window are announced as one participant-count update (large rooms).
     presence-debounce: ${APP_PRESENCE_DEBOUNCE:PT0.25S}
-    # A participant whose connection closed may take its seat back within this time (reload, second tab, role-change
-    # reconnect) even if the room was locked or filled meanwhile.
     reconnect-window: ${APP_RECONNECT_WINDOW:PT30S}

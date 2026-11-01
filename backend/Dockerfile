@@ -3,6 +3,7 @@ FROM eclipse-temurin:21-jdk-alpine AS build
 WORKDIR /src
 COPY .mvn .mvn
 COPY mvnw pom.xml ./
+RUN sed -i 's/\r$//' mvnw
 RUN --mount=type=cache,target=/root/.m2 sh ./mvnw -q -B dependency:go-offline
 COPY src src
 # Tests run in CI (they need Docker for Testcontainers); the image build only packages.
