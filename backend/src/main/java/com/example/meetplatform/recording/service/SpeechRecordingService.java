@@ -1,0 +1,441 @@
+package com.example.meetplatform.recording.service;
+
+import com.example.meetplatform.common.audit.AuditActions;
+import com.example.meetplatform.common.audit.AuditService;
+import com.example.meetplatform.common.config.AppProperties;
+import com.example.meetplatform.common.exception.ApiException;
+import com.example.meetplatform.common.exception.ErrorCode;
+import com.example.meetplatform.common.response.PageParams;
+import com.example.meetplatform.common.response.PageResponse;
+import com.example.meetplatform.common.security.CurrentUser;
+import com.example.meetplatform.common.security.RateLimiter;
+import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.repository.MeetingRepository;
+import com.example.meetplatform.participant.entity.MeetingParticipant;
+import com.example.meetplatform.participant.service.ParticipantAccessService;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.AccessUrl;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Facets;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.FinishRequest;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Option;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.SpeechRecordingView;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.StartRequest;
+import com.example.meetplatform.recording.entity.SpeechRecording;
+import com.example.meetplatform.recording.repository.SpeechRecordingRepository;
+import com.example.meetplatform.room.entity.MeetingRoom;
+import com.example.meetplatform.room.service.RoomSessionService;
+import jakarta.persistence.criteria.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.time.Clock;
+import java.time.DateTimeException;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+/**
+ * Speaking clips: each participant's browser records its own microphone (and camera) while the media server reports
+ * it speaking, and streams the clip here in numbered chunks. The server decides everything about the file:
+ * <ul>
+ *   <li>where: {@code DD-MM-YYYY/<Meeting_Title>/<Participant_Name>/} under {@code RECORDING_STORAGE_PATH}, dates
+ *   and the file's timestamp in the meeting's time zone (the zone its schedule uses), at the server's start time;</li>
+ *   <li>the name: {@code DDMMYYHHmmss_<id>.webm} with a random id, so clips in the same second never collide and an
+ *   existing file is never replaced;</li>
+ *   <li>when it is complete: only after the file was finalized and verified as WebM (otherwise INCOMPLETE/FAILED).</li>
+ * </ul>
+ * Clips are only recorded in meetings with automatic recording on, where everyone is told before joining.
+ *
+ * <p>Access: the meeting's host sees every clip of its meetings; a signed-in participant sees its own. Files are only
+ * served through signed URLs valid for minutes, issued after that check; the storage path never leaves the server.
+ */
+@Service
+public class SpeechRecordingService {
+
+    private static final Logger log = LoggerFactory.getLogger(SpeechRecordingService.class);
+    public static final String CONTENT_PATH = "/api/v1/speech-recordings/{id}/content";
+    private static final DateTimeFormatter QUERY_DATE = DateTimeFormatter.ISO_LOCAL_DATE;
+    private static final DateTimeFormatter FOLDER_DATE = DateTimeFormatter.ofPattern("dd-MM-yyyy");
+    private static final int NAME_ATTEMPTS = 5;
+
+    private final SpeechRecordingRepository recordings;
+    private final MeetingRepository meetings;
+    private final ParticipantAccessService participantAccess;
+    private final RoomSessionService roomSessions;
+    private final SpeechClipStorage storage;
+    private final RateLimiter rateLimiter;
+    private final AuditService audit;
+    private final TransactionTemplate tx;
+    private final Clock clock;
+    private final long maxChunkBytes;
+    private final long maxClipBytes;
+    private final Duration accessTtl;
+    private final String publicUrl;
+    private final byte[] signingKey;
+
+    public SpeechRecordingService(SpeechRecordingRepository recordings, MeetingRepository meetings,
+                                  ParticipantAccessService participantAccess, RoomSessionService roomSessions,
+                                  SpeechClipStorage storage, RateLimiter rateLimiter, AuditService audit,
+                                  TransactionTemplate tx, AppProperties properties, Clock clock,
+                                  @Value("${app.speech-recordings.max-chunk-bytes:8388608}") long maxChunkBytes,
+                                  @Value("${app.speech-recordings.max-clip-bytes:524288000}") long maxClipBytes,
+                                  @Value("${app.speech-recordings.access-url-ttl:PT10M}") Duration accessTtl) {
+        this.recordings = recordings;
+        this.meetings = meetings;
+        this.participantAccess = participantAccess;
+        this.roomSessions = roomSessions;
+        this.storage = storage;
+        this.rateLimiter = rateLimiter;
+        this.audit = audit;
+        this.tx = tx;
+        this.clock = clock;
+        this.maxChunkBytes = maxChunkBytes;
+        this.maxClipBytes = maxClipBytes;
+        this.accessTtl = accessTtl;
+        this.publicUrl = properties.publicUrl().replaceAll("/+$", "");
+        // A key of its own: an access-token or object-storage signature can never double as a clip signature.
+        this.signingKey = hmac(properties.security().jwtSecret().getBytes(StandardCharsets.UTF_8), "speech-recordings");
+    }
+
+    // ------------------------------------------------------------------ recording (the participant's browser)
+
+    @Transactional
+    public SpeechRecordingView start(UUID meetingId, StartRequest request, String token, Optional<CurrentUser> user) {
+        // Admitted to the live session (ADMITTED or JOINED): a participant may start speaking before the media
+        // server's "joined" notification has been processed, and it only ever records its own microphone.
+        MeetingParticipant participant = participantAccess.resolvePresent(meetingId, request.participantId(), token, user);
+        rateLimiter.check("speech-recording", participant.getId().toString(), 60, Duration.ofMinutes(1));
+        Meeting meeting = meetings.findById(meetingId).orElseThrow(() -> ApiException.notFound("Meeting"));
+        if (!meeting.isAutoRecord()) {
+            throw new ApiException(ErrorCode.CONFLICT,
+                    "Speaking clips are only recorded in meetings with automatic recording on.");
+        }
+        MeetingRoom room = roomSessions.active(meetingId)
+                .filter(r -> r.getId().equals(participant.getRoomId()))
+                .orElseThrow(() -> new ApiException(ErrorCode.MEETING_NOT_ACTIVE, "The meeting is not live."));
+        storage.requireFreeSpace();
+        // A clip still open for this participant (its browser reloaded or lost the finish): keep what it has. Locked
+        // and read fresh first, so a chunk still being written to it completes before it is closed.
+        for (UUID openId : recordings.openClipIds(participant.getId())) {
+            recordings.findByIdForUpdate(openId).filter(SpeechRecording::isRecording)
+                    .ifPresent(open -> closeAbandoned(open, "A new recording started before this one was finished."));
+        }
+        recordings.flush();
+
+        Instant start = clock.instant();
+        ZoneId zone = zoneOf(meeting);
+        String format = request.format().toLowerCase(Locale.ROOT).split(";")[0].strip();
+        // The name: start time to the second plus 24 random bits; a name already on disk is skipped, and the unique
+        // storage_path constraint is the last guard (two clips can never get the same file).
+        for (int attempt = 0; attempt < NAME_ATTEMPTS; attempt++) {
+            String uniqueId = HexFormat.of().formatHex(randomBytes(3));
+            String path = storage.relativePath(start, zone, meeting.getTitle(), participant.getDisplayName(), uniqueId);
+            if (storage.exists(path)) {
+                continue;
+            }
+            SpeechRecording clip = new SpeechRecording(UUID.randomUUID(), meetingId, room.getId(), participant.getId(),
+                    participant.getUserId(), meeting.getHostId(), meeting.getTitle(), participant.getDisplayName(),
+                    SpeechClipStorage.fileName(start, zone, uniqueId), path, format, start);
+            recordings.saveAndFlush(clip);
+            return SpeechRecordingView.of(clip);
+        }
+        throw new ApiException(ErrorCode.CONFLICT, "Could not reserve a file name for the recording. Try again.");
+    }
+
+    /**
+     * Appends chunk {@code seq} (0, 1, 2, ...). A chunk that was already stored (a retry) is accepted and ignored; a
+     * chunk after a missing one is refused, so the file never has a hole.
+     */
+    @Transactional
+    public SpeechRecordingView appendChunk(UUID meetingId, UUID recordingId, UUID participantId, int seq,
+                                           InputStream body, long contentLength, String token,
+                                           Optional<CurrentUser> user) {
+        MeetingParticipant participant = participantAccess.resolve(meetingId, participantId, token, user);
+        rateLimiter.check("speech-recording-chunk", participant.getId().toString(), 600, Duration.ofMinutes(1));
+        if (contentLength > maxChunkBytes) {
+            throw new ApiException(ErrorCode.FILE_TOO_LARGE, "Recording chunks must be at most " + maxChunkBytes + " bytes.");
+        }
+        SpeechRecording clip = ownClipForUpdate(meetingId, recordingId, participant);
+        if (!clip.isRecording()) {
+            throw new ApiException(ErrorCode.RECORDING_NOT_ACTIVE, "This recording is no longer being recorded.");
+        }
+        if (seq < clip.getChunksReceived()) {
+            return SpeechRecordingView.of(clip);
+        }
+        if (seq > clip.getChunksReceived()) {
+            throw new ApiException(ErrorCode.CONFLICT, "Expected chunk " + clip.getChunksReceived() + ", got " + seq + ".");
+        }
+        long size = storage.append(clip.getStoragePath(), new BoundedInputStream(body, maxChunkBytes),
+                clip.getFileSize(), maxClipBytes);
+        clip.chunkStored(size, clock.instant());
+        return SpeechRecordingView.of(clip);
+    }
+
+    /**
+     * Ends the clip. COMPLETED only when every chunk arrived and the file was finalized and verified; with chunks
+     * missing it is kept as INCOMPLETE; with no usable media it is FAILED. Finishing twice returns the result again.
+     */
+    @Transactional
+    public SpeechRecordingView finish(UUID meetingId, UUID recordingId, FinishRequest request, String token,
+                                      Optional<CurrentUser> user) {
+        MeetingParticipant participant = participantAccess.resolve(meetingId, request.participantId(), token, user);
+        SpeechRecording clip = ownClipForUpdate(meetingId, recordingId, participant);
+        if (!clip.isRecording()) {
+            return SpeechRecordingView.of(clip);
+        }
+        Instant now = clock.instant();
+        if (request.chunks() != clip.getChunksReceived()) {
+            closeAbandoned(clip, "Only " + clip.getChunksReceived() + " of " + request.chunks() + " parts arrived.");
+            return SpeechRecordingView.of(clip);
+        }
+        try {
+            long size = storage.finish(clip.getStoragePath());
+            clip.complete(size, now, Math.max(0, now.toEpochMilli() - clip.getStartTime().toEpochMilli()));
+        } catch (ApiException e) {
+            if (e.code() != ErrorCode.CONFLICT) {
+                // Storage unavailable: left RECORDING, so a retry, or the recovery job, can still finalize it.
+                throw e;
+            }
+            clip.fail(now, "No valid media was received.");
+        }
+        return SpeechRecordingView.of(clip);
+    }
+
+    /**
+     * Clips still RECORDING with no chunk since {@code staleAfter} (the browser is gone, or the server restarted while
+     * they were recorded): what arrived is kept as INCOMPLETE, or FAILED when nothing usable arrived. Never COMPLETED.
+     * Each clip is closed in a transaction of its own, so one clip that cannot be closed never holds up the others.
+     */
+    public int recoverStale(Duration staleAfter) {
+        int n = 0;
+        for (SpeechRecording clip : recordings.findStale(clock.instant().minus(staleAfter))) {
+            try {
+                Boolean closed = tx.execute(status -> recordings.findByIdForUpdate(clip.getId())
+                        .filter(SpeechRecording::isRecording)
+                        .map(locked -> {
+                            closeAbandoned(locked, "The recording was not finished (connection lost or server restarted).");
+                            return true;
+                        })
+                        .orElse(false));
+                if (Boolean.TRUE.equals(closed)) {
+                    n++;
+                }
+            } catch (RuntimeException e) {
+                log.warn("Could not recover speaking clip {}: {}", clip.getId(), e.toString());
+            }
+        }
+        return n;
+    }
+
+    private void closeAbandoned(SpeechRecording clip, String reason) {
+        long size;
+        try {
+            size = storage.salvage(clip.getStoragePath());
+        } catch (ApiException e) {
+            if (e.code() != ErrorCode.NOT_FOUND) {
+                throw e;
+            }
+            // Its stored path is not a usable path on this server: there is no file to keep.
+            size = -1;
+        }
+        Instant end = clip.getLastChunkAt() != null ? clip.getLastChunkAt() : clock.instant();
+        if (size > 0) {
+            clip.incomplete(size, end, reason);
+        } else {
+            clip.fail(end, "No valid media was received. " + reason);
+        }
+    }
+
+    private SpeechRecording ownClipForUpdate(UUID meetingId, UUID recordingId, MeetingParticipant participant) {
+        return recordings.findByIdForUpdate(recordingId)
+                .filter(r -> r.getMeetingId().equals(meetingId) && r.getParticipantId().equals(participant.getId()))
+                .orElseThrow(() -> ApiException.notFound("Recording"));
+    }
+
+    // ------------------------------------------------------------------ dashboard (signed-in users)
+
+    /**
+     * {@code view}: "hosted" (every clip of the meetings the user hosts) or "mine" (the clips of the user's own
+     * participations). Filters: folder date (YYYY-MM-DD), meeting, participant.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<SpeechRecordingView> list(CurrentUser user, String view, LocalDate date, UUID meetingId,
+                                                  UUID participantId, Integer page, Integer size) {
+        boolean hosted = isHosted(view);
+        Specification<SpeechRecording> spec = (root, query, cb) -> {
+            List<Predicate> where = new ArrayList<>();
+            where.add(cb.equal(root.get(hosted ? "hostId" : "participantUserId"), user.userId()));
+            if (date != null) {
+                where.add(cb.like(root.get("storagePath"), FOLDER_DATE.format(date) + "/%"));
+            }
+            if (meetingId != null) {
+                where.add(cb.equal(root.get("meetingId"), meetingId));
+            }
+            if (participantId != null) {
+                where.add(cb.equal(root.get("participantId"), participantId));
+            }
+            return cb.and(where.toArray(Predicate[]::new));
+        };
+        var result = recordings.findAll(spec, PageParams.of(page, size, Sort.by(Sort.Direction.DESC, "startTime")));
+        return PageResponse.of(result, SpeechRecordingView::of);
+    }
+
+    @Transactional(readOnly = true)
+    public Facets facets(CurrentUser user, String view) {
+        boolean hosted = isHosted(view);
+        UUID id = user.userId();
+        List<Option> meetingOptions = options(hosted ? recordings.hostedMeetings(id) : recordings.ownMeetings(id));
+        List<Option> participantOptions = options(hosted ? recordings.hostedParticipants(id) : recordings.ownParticipants(id));
+        List<String> dates = (hosted ? recordings.hostedDates(id) : recordings.ownDates(id)).stream()
+                .map(d -> LocalDate.parse(d, FOLDER_DATE))
+                .sorted(Comparator.reverseOrder())
+                .map(QUERY_DATE::format)
+                .toList();
+        return new Facets(meetingOptions, participantOptions, dates);
+    }
+
+    @Transactional(readOnly = true)
+    public SpeechRecordingView get(UUID recordingId, CurrentUser user) {
+        return SpeechRecordingView.of(authorized(recordingId, user));
+    }
+
+    /** A signed URL to play ({@code download=false}) or download the clip, valid for a few minutes. */
+    @Transactional
+    public AccessUrl accessUrl(UUID recordingId, boolean download, CurrentUser user) {
+        SpeechRecording clip = authorized(recordingId, user);
+        if (clip.getStatus() != SpeechRecording.Status.COMPLETED && clip.getStatus() != SpeechRecording.Status.INCOMPLETE) {
+            throw new ApiException(ErrorCode.CONFLICT, "This recording has no file to play.");
+        }
+        Instant expiresAt = clock.instant().plus(accessTtl);
+        long expires = expiresAt.getEpochSecond();
+        String url = publicUrl + CONTENT_PATH.replace("{id}", clip.getId().toString())
+                + "?expires=" + expires + "&download=" + download + "&sig=" + sign(clip.getId(), expires, download);
+        audit.record(user.userId(), null, AuditActions.SPEECH_RECORDING_ACCESSED, AuditActions.RESOURCE_SPEECH_RECORDING,
+                clip.getId(), Map.of("download", download));
+        return new AccessUrl(url, expiresAt);
+    }
+
+    /** The file behind a signed URL (the signature is the authorization, like a presigned storage URL). */
+    @Transactional(readOnly = true)
+    public ClipFile content(UUID recordingId, long expires, boolean download, String signature) {
+        String expected = sign(recordingId, expires, download);
+        if (signature == null || !MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
+                signature.getBytes(StandardCharsets.US_ASCII))) {
+            throw ApiException.forbidden("This link is not valid.");
+        }
+        if (clock.instant().getEpochSecond() > expires) {
+            throw ApiException.forbidden("This link has expired.");
+        }
+        SpeechRecording clip = recordings.findById(recordingId).orElseThrow(() -> ApiException.notFound("Recording"));
+        return new ClipFile(storage.readable(clip.getStoragePath()), clip.getFileName(), clip.getFileFormat(), download);
+    }
+
+    public record ClipFile(Path path, String fileName, String contentType, boolean download) {
+    }
+
+    /** The clip, if this user may see it (its meeting's host, or the participant it belongs to); 404 otherwise. */
+    private SpeechRecording authorized(UUID recordingId, CurrentUser user) {
+        return recordings.findById(recordingId)
+                .filter(r -> user.userId().equals(r.getHostId()) || user.userId().equals(r.getParticipantUserId()))
+                .orElseThrow(() -> ApiException.notFound("Recording"));
+    }
+
+    private static boolean isHosted(String view) {
+        if (view == null || view.equals("hosted")) {
+            return true;
+        }
+        if (view.equals("mine")) {
+            return false;
+        }
+        throw new ApiException(ErrorCode.VALIDATION_FAILED, "view must be \"hosted\" or \"mine\".");
+    }
+
+    private static List<Option> options(List<Object[]> rows) {
+        return rows.stream().map(r -> new Option((UUID) r[0], (String) r[1]))
+                .sorted(Comparator.comparing(Option::label, String.CASE_INSENSITIVE_ORDER)).toList();
+    }
+
+    private static ZoneId zoneOf(Meeting meeting) {
+        try {
+            return meeting.getTimeZone() == null ? ZoneOffset.UTC : ZoneId.of(meeting.getTimeZone());
+        } catch (DateTimeException e) {
+            return ZoneOffset.UTC;
+        }
+    }
+
+    private String sign(UUID id, long expires, boolean download) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(hmac(signingKey, id + "\n" + expires + "\n" + download));
+    }
+
+    private static byte[] randomBytes(int n) {
+        byte[] b = new byte[n];
+        new java.security.SecureRandom().nextBytes(b);
+        return b;
+    }
+
+    private static byte[] hmac(byte[] key, String data) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Stops reading after {@code limit} bytes, failing the chunk, so a client cannot stream an unbounded body. */
+    static final class BoundedInputStream extends InputStream {
+        private final InputStream in;
+        private long remaining;
+
+        BoundedInputStream(InputStream in, long limit) {
+            this.in = in;
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n <= 0 ? -1 : one[0] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = in.read(b, off, len);
+            if (n > 0) {
+                remaining -= n;
+                if (remaining < 0) {
+                    throw new ApiException(ErrorCode.FILE_TOO_LARGE, "Recording chunk too large.");
+                }
+            }
+            return n;
+        }
+    }
+}

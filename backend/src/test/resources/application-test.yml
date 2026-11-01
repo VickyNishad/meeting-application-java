@@ -1,0 +1,53 @@
+app:
+  speech-recordings:
+    storage-path: target/test-speech-recordings
+    # Tests control recovery explicitly.
+    recovery-interval: PT24H
+  public-url: http://localhost:5173
+  security:
+    jwt-secret: test-only-secret-0123456789-abcdefghijklmnopqrstuvwxyz
+    cookie-secure: false
+    metrics-scrape-password: test-scrape-password
+  auth:
+    require-email-verification: true
+  livekit:
+    api-key: test-api-key
+    api-secret: test-api-secret-0123456789-abcdefghijklmnop
+  storage:
+    access-key: test-access-key
+    secret-key: test-secret-key
+  rate-limit:
+    enabled: false
+  coordination:
+    store: memory
+  meetings:
+    # Short, so tests can observe a dropped host's successor without waiting the production 20 s.
+    host-dropout-grace: PT0.5S
+    # Announced at once, so tests can observe every update.
+    presence-debounce: PT0S
+  notifications:
+    dispatch-enabled: false
+
+spring:
+  flyway:
+    clean-disabled: false
+
+management:
+  health:
+    redis:
+      enabled: false
+  endpoint:
+    health:
+      group:
+        readiness:
+          include: readinessState,db
+  tracing:
+    export:
+      enabled: false
+    sampling:
+      probability: 0.0
+
+logging:
+  level:
+    root: WARN
+    com.example.meetplatform: INFO

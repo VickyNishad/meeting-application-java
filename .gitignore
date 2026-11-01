@@ -1,0 +1,20 @@
+# secrets
+.env
+*.pem
+*.key
+
+# build output
+backend/target/
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+loadtest/results/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

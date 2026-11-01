@@ -1,0 +1,37 @@
+# Social sign-in. Activate with SPRING_PROFILES_ACTIVE=oauth after registering the apps:
+#   Google:    redirect URI  <public-url>/login/oauth2/code/google
+#   Microsoft: redirect URI  <public-url>/login/oauth2/code/microsoft
+#              Microsoft does not send email_verified: add the optional ID-token claims "email" and "xms_edov"
+#              to the app registration, otherwise sign-up is refused while e-mail verification is required.
+# The reverse proxy must route /oauth2/ and /login/oauth2/ to the backend.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID}
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope: openid,email,profile
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+          microsoft:
+            client-id: ${MICROSOFT_CLIENT_ID}
+            client-secret: ${MICROSOFT_CLIENT_SECRET}
+            scope: openid,email,profile
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            client-name: Microsoft
+        provider:
+          microsoft:
+            # Explicit endpoints instead of issuer-uri: for the multi-tenant authorities (common / organizations /
+            # consumers) the discovered issuer is https://login.microsoftonline.com/{tenant id}/v2.0, which never
+            # equals the configured issuer, so issuer-uri discovery and the default ID-token issuer check fail.
+            # The issuer is validated by MicrosoftIssuerValidator (issuer must match the token's tenant id).
+            authorization-uri: https://login.microsoftonline.com/${MICROSOFT_TENANT:common}/oauth2/v2.0/authorize
+            token-uri: https://login.microsoftonline.com/${MICROSOFT_TENANT:common}/oauth2/v2.0/token
+            jwk-set-uri: https://login.microsoftonline.com/${MICROSOFT_TENANT:common}/discovery/v2.0/keys
+            user-name-attribute: sub
+
+app:
+  oauth:
+    microsoft-tenant: ${MICROSOFT_TENANT:common}

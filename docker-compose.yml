@@ -1,0 +1,371 @@
+# Full local stack: PostgreSQL, Redis, S3-compatible storage, Mailpit, LiveKit SFU + Egress, API and web.
+#   cp .env.example .env   # then edit secrets
+#   docker compose up -d --build
+#   docker compose --profile observability up -d     # adds Prometheus, Grafana, Jaeger
+#   docker compose up -d postgres pgadmin               # database + pgAdmin only (http://localhost:5050)
+# Step-by-step Windows guide and helper scripts: README-Docker.md, scripts/docker-*.bat
+# Web app: http://localhost:3000   Mail: http://localhost:8025
+#
+# Persistence on the D: drive (Windows, Docker Desktop with the WSL 2 engine):
+#   - DATA_ROOT (default D:/meetly/docker) holds MinIO (recordings and shared files), Redis and nightly database
+#     backups as plain folders you can see in Explorer.
+#   - PostgreSQL ("pgdata"), Prometheus and Grafana use named volumes: PostgreSQL refuses (or runs slowly on) a data directory
+#     bind-mounted from a Windows drive. To put it on D: too, move Docker Desktop's disk image there
+#     (Settings > Resources > Advanced > Disk image location = D:\...). The nightly dump in DATA_ROOT/backups is
+#     the copy to restore from (see docs/07-deployment.md).
+name: meet-platform
+
+x-restart: &restart
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *restart
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-meet}
+      POSTGRES_USER: ${POSTGRES_USER:-meet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Run once, when the pgdata volume is first created (an existing database never re-runs them).
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Loopback only: reachable from this PC (IDE, DBeaver, psql), not from the network.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # Over TCP (-h 127.0.0.1), not the Unix socket: on the first start the image initialises the database on a
+      # temporary socket-only server, so a socket check would report healthy before other containers can connect.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2g }
+
+  # Nightly logical backup (pg_dump custom format) into DATA_ROOT/backups, keeping 14 days.
+  # Restore: pg_restore --clean --if-exists -h localhost -U meet -d meet <file>   (see docs/07-deployment.md)
+  pg-backup:
+    <<: *restart
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-meet}
+      PGDATABASE: ${POSTGRES_DB:-meet}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-D:/meetly/docker}/backups
+        target: /backups
+        bind: { create_host_path: true }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f="/backups/meet-$$(date +%Y%m%d-%H%M%S).dump"
+          if pg_dump -Fc -f "$$f.part"; then mv "$$f.part" "$$f"; echo "backup written: $$f"; else rm -f "$$f.part"; echo "backup FAILED"; fi
+          find /backups -name 'meet-*.dump' -mtime +14 -delete
+          sleep 86400
+        done
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+
+  # Database web UI: http://localhost:5050. The server "Meeting DB (docker)" is registered from servers.json on
+  # first start (host "postgres" = the service name on the Compose network, never localhost from inside a container).
+  pgadmin:
+    <<: *restart
+    image: dpage/pgadmin4:9.18.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@domain.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?set in .env}
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_LISTEN_PORT: "80"
+    volumes:
+      - pgadmindata:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512m }
+
+  redis:
+    <<: *restart
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}", "--appendonly", "yes"]
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-D:/meetly/docker}/redis
+        target: /data
+        bind: { create_host_path: true }
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  # Upstream MinIO stopped publishing community images; this is a maintained build of the same server,
+  # pinned by release. Any S3-compatible store (AWS S3, Cloudflare R2, Ceph RGW, SeaweedFS) works instead.
+  minio:
+    <<: *restart
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set in .env}
+    volumes:
+      # Recordings: DATA_ROOT/minio/<recordings bucket>/recordings/<meetingId>/<recordingId>.mp4
+      - type: bind
+        source: ${DATA_ROOT:-D:/meetly/docker}/minio
+        target: /data
+        bind: { create_host_path: true }
+    ports:
+      - "9000:9000"
+      - "127.0.0.1:9001:9001"
+    # No healthcheck: which probe tools (mc, curl) this image ships is not verified, and a probe that cannot run
+    # would keep the whole stack from starting. Dependents wait for the container to start; the API creates the
+    # buckets on startup and the egress worker retries uploads.
+
+  mailpit:
+    <<: *restart
+    image: axllent/mailpit:v1.32.0
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+
+  livekit:
+    <<: *restart
+    image: livekit/livekit-server:v1.13.11
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # Rendered by Compose from .env so no secret lives in a committed file.
+      LIVEKIT_CONFIG: |
+        port: 7880
+        bind_addresses: ["0.0.0.0"]
+        prometheus_port: 6789
+        rtc:
+          tcp_port: 7881
+          port_range_start: 50000
+          port_range_end: 50100
+          use_external_ip: false
+          node_ip: ${LIVEKIT_NODE_IP:-127.0.0.1}
+        redis:
+          address: redis:6379
+          password: ${REDIS_PASSWORD}
+        keys:
+          ${LIVEKIT_API_KEY:?set in .env}: ${LIVEKIT_API_SECRET:?set in .env}
+        webhook:
+          api_key: ${LIVEKIT_API_KEY}
+          urls:
+            - http://backend:8080/api/v1/webhooks/livekit
+        room:
+          empty_timeout: 300
+          departure_timeout: 20
+        # Voice-activity detection for "who is speaking" (green tile frame, speaker view, speaking time). These are LiveKit's
+        # defaults, written out so they can be tuned: raise min_percentile or lower active_level if background noise
+        # triggers it; the client adds a 600 ms hold over pauses (web/src/pages/room/speaking.ts).
+        audio:
+          # loudest level that still counts as silence, 0-127 where 0 is loudest (35 = -35 dBov)
+          active_level: 35
+          # share of each interval (%) the audio must be above that level to count as speaking
+          min_percentile: 40
+          # how often speaker changes are sent to clients, ms
+          update_interval: 400
+          # audio levels averaged over this many intervals
+          smooth_intervals: 2
+        logging:
+          level: info
+    ports:
+      - "7880:7880"
+      - "7881:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+
+  egress:
+    <<: *restart
+    image: livekit/egress:v1.15.0
+    depends_on:
+      livekit:
+        condition: service_started
+      minio:
+        condition: service_started
+    cap_add:
+      - SYS_ADMIN   # required by headless Chrome used for composite recordings
+    # Headless Chrome needs a larger /dev/shm; one composite recording uses roughly 2-4 vCPUs.
+    shm_size: 1gb
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 4g }
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit:7880
+        redis:
+          address: redis:6379
+          password: ${REDIS_PASSWORD}
+        health_port: 9090
+        log_level: info
+        s3:
+          access_key: ${S3_ACCESS_KEY}
+          secret: ${S3_SECRET_KEY}
+          region: us-east-1
+          endpoint: http://minio:9000
+          # Same bucket the API reads recordings from (S3_RECORDINGS_BUCKET).
+          bucket: ${S3_RECORDINGS_BUCKET:-meet-recordings}
+          force_path_style: true
+
+  backend:
+    <<: *restart
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2g }
+    environment:
+      # Speaking clips (Recordings/DD-MM-YYYY/Meeting/Participant/...), on the host folder mounted below.
+      RECORDING_STORAGE_PATH: /data/recordings
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-meet}
+      DB_USERNAME: ${POSTGRES_USER:-meet}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL}
+      APP_CORS_ALLOWED_ORIGINS: ${APP_CORS_ALLOWED_ORIGINS}
+      APP_JWT_SECRET: ${APP_JWT_SECRET:?set in .env}
+      APP_COOKIE_SECURE: ${APP_COOKIE_SECURE:-true}
+      APP_REQUIRE_EMAIL_VERIFICATION: ${APP_REQUIRE_EMAIL_VERIFICATION:-true}
+      APP_OPENAPI_ENABLED: ${APP_OPENAPI_ENABLED:-false}
+      APP_RECORDING_RETENTION_DAYS: ${APP_RECORDING_RETENTION_DAYS:-90}
+      APP_MAIL_FROM: ${APP_MAIL_FROM}
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL}
+      LIVEKIT_API_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-meet-recordings}
+      # Room signal numbers and scheduled-job locks are shared through Redis.
+      APP_COORDINATION_STORE: redis
+      # /actuator/prometheus is closed unless this is set; Prometheus reads the same value (see secrets below).
+      APP_METRICS_SCRAPE_PASSWORD: ${APP_METRICS_SCRAPE_PASSWORD:-}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_AUTH: ${SMTP_AUTH:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      APP_CALENDAR_ENCRYPTION_KEY: ${APP_CALENDAR_ENCRYPTION_KEY:-}
+      APP_CALENDAR_CALLBACK_BASE_URL: ${APP_CALENDAR_CALLBACK_BASE_URL:-}
+      GOOGLE_CALENDAR_CLIENT_ID: ${GOOGLE_CALENDAR_CLIENT_ID:-}
+      GOOGLE_CALENDAR_CLIENT_SECRET: ${GOOGLE_CALENDAR_CLIENT_SECRET:-}
+      MICROSOFT_CALENDAR_CLIENT_ID: ${MICROSOFT_CALENDAR_CLIENT_ID:-}
+      MICROSOFT_CALENDAR_CLIENT_SECRET: ${MICROSOFT_CALENDAR_CLIENT_SECRET:-}
+      MICROSOFT_CALENDAR_TENANT: ${MICROSOFT_CALENDAR_TENANT:-common}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_SAMPLING_PROBABILITY: ${OTEL_SAMPLING_PROBABILITY:-0.1}
+    volumes:
+      # A plain folder on the host (DATA_ROOT, default D:/meetly/docker): survives rebuilding and recreating the container.
+      - type: bind
+        source: ${DATA_ROOT:-D:/meetly/docker}/Recordings
+        target: /data/recordings
+        bind: { create_host_path: true }
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  web:
+    <<: *restart
+    build: ./web
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+
+  # ---- observability (docker compose --profile observability up -d) ------------------------------
+  prometheus:
+    <<: *restart
+    profiles: ["observability"]
+    image: prom/prometheus:v3.15.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    # Scrapes /actuator/prometheus with HTTP Basic prometheus:<APP_METRICS_SCRAPE_PASSWORD>.
+    secrets:
+      - metrics_scrape_password
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Named volume: Prometheus runs as "nobody" and cannot write a root-owned host folder (and its TSDB needs real
+      # Linux file semantics). It lands on D: with Docker Desktop's disk image, like pgdata.
+      - prometheusdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    <<: *restart
+    profiles: ["observability"]
+    image: grafana/grafana:13.2.5
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Named volume for the same reason as Prometheus (Grafana runs as uid 472).
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3001:3000"
+
+  jaeger:
+    <<: *restart
+    profiles: ["observability"]
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "127.0.0.1:16686:16686"
+
+secrets:
+  metrics_scrape_password:
+    environment: APP_METRICS_SCRAPE_PASSWORD
+
+# PostgreSQL, Prometheus and Grafana use named volumes (see the header). redisdata and miniodata are kept so data
+# written by earlier versions of this file is not orphaned; copy it to DATA_ROOT before removing them.
+# One private bridge network for the whole stack; containers reach each other by service name (postgres, redis, ...).
+networks:
+  default:
+    name: meet-platform-net
+
+volumes:
+  pgdata:
+  pgadmindata:
+  prometheusdata:
+  grafanadata:
+  redisdata:
+  miniodata:

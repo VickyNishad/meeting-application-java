@@ -1,0 +1,281 @@
+import { useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Check, Circle, Loader2, MicOff, Square, UserCheck, X } from 'lucide-react';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Label, NativeSelect, Switch } from '@/components/ui/primitives';
+import { moderationApi, recordingsApi } from '@/lib/api/endpoints';
+import { errorMessage } from '@/lib/api/problem';
+import type { Recording, ScreenSharePolicy } from '@/lib/api/types';
+import { isRoomRecording, recordingSubject } from '@/lib/recordings';
+import { formatTime } from '@/lib/time';
+import { useMeetingRoom } from './roomContext';
+import { PanelChrome } from './PanelChrome';
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="border-b border-white/10 px-4 py-4">
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-neutral-400">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
+function WaitingList() {
+  const { meeting } = useMeetingRoom();
+  const qc = useQueryClient();
+  // Kept current by `waiting-room` signals; polling is a backstop while the panel is open and visible.
+  const q = useQuery({
+    queryKey: ['waiting', meeting.id],
+    queryFn: () => moderationApi.waiting(meeting.id),
+    refetchInterval: 5000,
+    refetchIntervalInBackground: false,
+  });
+  const refresh = () => qc.invalidateQueries({ queryKey: ['waiting', meeting.id] });
+  const onErr = (e: unknown) => toast.error(errorMessage(e));
+  const admit = useMutation({ mutationFn: (pid: string) => moderationApi.admit(meeting.id, pid), onSuccess: refresh, onError: onErr });
+  const deny = useMutation({ mutationFn: (pid: string) => moderationApi.deny(meeting.id, pid), onSuccess: refresh, onError: onErr });
+  const admitAll = useMutation({
+    mutationFn: () => moderationApi.admitAll(meeting.id),
+    onSuccess: () => {
+      toast.success('Everyone was admitted');
+      void refresh();
+    },
+    onError: onErr,
+  });
+
+  const waiting = q.data ?? [];
+  return (
+    <Section title={`Waiting room (${waiting.length})`}>
+      {q.isPending && <Loader2 className="size-4 animate-spin text-neutral-400" aria-label="Loading waiting room" />}
+      {q.isError && <p className="text-sm text-red-300">{errorMessage(q.error)}</p>}
+      {q.data && waiting.length === 0 && <p className="text-sm text-neutral-400">No one is waiting.</p>}
+      {waiting.length > 0 && (
+        <>
+          <ul className="mb-3 space-y-2">
+            {waiting.map((w) => (
+              <li key={w.id} className="flex items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-sm">
+                <span className="min-w-0 flex-1 truncate">
+                  {w.displayName}
+                  {w.role === 'GUEST' && <span className="ml-1 text-xs text-neutral-400">(guest)</span>}
+                </span>
+                <Button size="icon" variant="ghost" className="size-8 text-success hover:bg-white/10" aria-label={`Admit ${w.displayName}`} onClick={() => admit.mutate(w.id)} disabled={admit.isPending}>
+                  <Check aria-hidden="true" />
+                </Button>
+                <Button size="icon" variant="ghost" className="size-8 text-red-400 hover:bg-white/10" aria-label={`Deny ${w.displayName}`} onClick={() => deny.mutate(w.id)} disabled={deny.isPending}>
+                  <X aria-hidden="true" />
+                </Button>
+              </li>
+            ))}
+          </ul>
+          <Button size="sm" className="w-full" onClick={() => admitAll.mutate()} loading={admitAll.isPending}>
+            <UserCheck aria-hidden="true" /> Admit all
+          </Button>
+        </>
+      )}
+    </Section>
+  );
+}
+
+function CloudRecording() {
+  const { meeting, join, cloudRecording, setCloudRecording, stageOnly } = useMeetingRoom();
+  const [layout, setLayout] = useState<'grid' | 'speaker'>('speaker');
+  const [busy, setBusy] = useState(false);
+  const q = useQuery({ queryKey: ['meeting', meeting.id, 'recordings'], queryFn: () => recordingsApi.forMeeting(meeting.id, join.waitToken), refetchInterval: 10_000 });
+  const active = q.data?.find((r) => isRoomRecording(r) && (r.status === 'ACTIVE' || r.status === 'STARTING' || r.status === 'STOPPING'));
+  const isOn = cloudRecording || !!active;
+
+  const start = async () => {
+    setBusy(true);
+    try {
+      await recordingsApi.start(meeting.id, { layout, audioOnly: meeting.mediaMode === 'AUDIO_ONLY' });
+      setCloudRecording(true);
+      toast.success('Cloud recording is starting');
+      void q.refetch();
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const stop = async () => {
+    setBusy(true);
+    try {
+      let rec = active;
+      if (!rec) rec = (await q.refetch()).data?.find((r) => isRoomRecording(r) && (r.status === 'ACTIVE' || r.status === 'STARTING'));
+      if (!rec) throw new Error('No active cloud recording was found for this meeting.');
+      await recordingsApi.stop(meeting.id, rec.id);
+      setCloudRecording(false);
+      toast.success('Cloud recording stopped — it will appear in the library after processing.');
+      void q.refetch();
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section title="Cloud recording">
+      {isOn ? (
+        <div className="grid gap-2">
+          <p className="flex items-center gap-2 text-sm">
+            <Circle className="size-2.5 animate-pulse fill-red-500 text-red-500" aria-hidden="true" />
+            Recording{active?.status ? ` (${active.status.toLowerCase()})` : ''}
+            {active?.startedAt && <span className="text-neutral-400">since {formatTime(active.startedAt)}</span>}
+          </p>
+          <Button size="sm" variant="destructive" onClick={() => void stop()} loading={busy}>
+            <Square aria-hidden="true" /> Stop recording
+          </Button>
+        </div>
+      ) : (
+        <div className="grid gap-2">
+          {meeting.mediaMode === 'VIDEO' && (
+            <div className="grid gap-1.5">
+              <Label htmlFor="rec-layout" className="text-neutral-300">
+                Layout
+              </Label>
+              <NativeSelect id="rec-layout" value={layout} onChange={(e) => setLayout(e.target.value as 'grid' | 'speaker')} className="border-white/15 bg-neutral-800">
+                <option value="grid">Gallery</option>
+                <option value="speaker">Active speaker</option>
+              </NativeSelect>
+            </div>
+          )}
+          <Button size="sm" onClick={() => void start()} loading={busy}>
+            <Circle className="fill-current" aria-hidden="true" /> Start cloud recording
+          </Button>
+          <p className="text-xs text-neutral-400">
+            Everyone in the meeting sees a recording indicator.
+            {stageOnly && ' Webinar: the recording shows the host and co-hosts only.'}
+          </p>
+        </div>
+      )}
+      <PersonRecordings recordings={q.data ?? []} onChanged={() => void q.refetch()} />
+    </Section>
+  );
+}
+
+/**
+ * Older per-person recordings (auto-record used to record each participant separately) that are still running:
+ * the host can stop them one by one. Nothing is shown once there are none; new recordings are room recordings only.
+ */
+function PersonRecordings({ recordings, onChanged }: { recordings: Recording[]; onChanged: () => void }) {
+  const { meeting } = useMeetingRoom();
+  const [stopping, setStopping] = useState<string | null>(null);
+  const running = recordings.filter((r) => !isRoomRecording(r) && (r.status === 'ACTIVE' || r.status === 'STARTING'));
+  if (running.length === 0) return null;
+
+  const stop = async (r: Recording) => {
+    setStopping(r.id);
+    try {
+      await recordingsApi.stop(meeting.id, r.id);
+      toast.success(`Stopped recording ${recordingSubject(r)}`);
+      onChanged();
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setStopping(null);
+    }
+  };
+
+  return (
+    <div className="mt-3 grid gap-2">
+      <p className="text-xs font-medium text-neutral-300">Individual recordings still running</p>
+      <ul className="grid gap-1.5">
+        {running.map((r) => (
+          <li key={r.id} className="flex items-center justify-between gap-2 text-sm">
+            <span className="flex min-w-0 items-center gap-2">
+              <Circle className="size-2 shrink-0 animate-pulse fill-red-500 text-red-500" aria-hidden="true" />
+              <span className="truncate">{recordingSubject(r)}</span>
+            </span>
+            <Button size="sm" variant="secondary" onClick={() => void stop(r)} loading={stopping === r.id} aria-label={`Stop recording ${recordingSubject(r)}`}>
+              <Square aria-hidden="true" /> Stop
+            </Button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function ModerationPanel({ onClose }: { onClose: () => void }) {
+  const { meeting, locked, setLocked, screenSharePolicy, setScreenSharePolicy, waitingRoomEnabled, setWaitingRoomEnabled, chatEnabled, setChatEnabled } =
+    useMeetingRoom();
+  const [pending, setPending] = useState<string | null>(null);
+
+  const run = async (key: string, fn: () => Promise<unknown>, success: string) => {
+    setPending(key);
+    try {
+      await fn();
+      toast.success(success);
+      return true;
+    } catch (e) {
+      toast.error(errorMessage(e));
+      return false;
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <PanelChrome title="Host controls" onClose={onClose}>
+      <WaitingList />
+      <Section title="Audio">
+        <Button size="sm" variant="secondary" className="w-full" loading={pending === 'mute-all'} onClick={() => void run('mute-all', () => moderationApi.muteAll(meeting.id), 'Everyone was muted')}>
+          <MicOff aria-hidden="true" /> Mute everyone
+        </Button>
+        <p className="mt-2 text-xs text-neutral-400">Hosts and co-hosts are not muted. Participants unmute themselves.</p>
+      </Section>
+      <Section title="Meeting settings">
+        <div className="grid gap-4">
+          <div className="flex items-center justify-between gap-3">
+            <Label htmlFor="mod-lock">Lock meeting</Label>
+            <Switch
+              id="mod-lock"
+              checked={locked}
+              disabled={pending === 'lock'}
+              onCheckedChange={(v) => void run('lock', () => moderationApi.lock(meeting.id, v), v ? 'Meeting locked' : 'Meeting unlocked').then((ok) => ok && setLocked(v))}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <Label htmlFor="mod-waiting">Waiting room</Label>
+            <Switch
+              id="mod-waiting"
+              checked={waitingRoomEnabled}
+              disabled={pending === 'waiting'}
+              onCheckedChange={(v) =>
+                void run('waiting', () => moderationApi.settings(meeting.id, { waitingRoomEnabled: v }), v ? 'Waiting room on' : 'Waiting room off').then((ok) => ok && setWaitingRoomEnabled(v))
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <Label htmlFor="mod-chat">Allow chat</Label>
+            <Switch
+              id="mod-chat"
+              checked={chatEnabled}
+              disabled={pending === 'chat'}
+              onCheckedChange={(v) => void run('chat', () => moderationApi.settings(meeting.id, { chatEnabled: v }), v ? 'Chat enabled' : 'Chat disabled').then((ok) => ok && setChatEnabled(v))}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="mod-share">Who can share their screen</Label>
+            <NativeSelect
+              id="mod-share"
+              value={screenSharePolicy}
+              disabled={pending === 'share'}
+              className="border-white/15 bg-neutral-800"
+              onChange={(e) => {
+                const v = e.target.value as ScreenSharePolicy;
+                void run('share', () => moderationApi.settings(meeting.id, { screenSharePolicy: v }), 'Screen-sharing policy updated').then((ok) => ok && setScreenSharePolicy(v));
+              }}
+            >
+              <option value="EVERYONE">Everyone</option>
+              <option value="HOSTS_ONLY">Hosts and co-hosts only</option>
+            </NativeSelect>
+          </div>
+        </div>
+      </Section>
+      <CloudRecording />
+    </PanelChrome>
+  );
+}

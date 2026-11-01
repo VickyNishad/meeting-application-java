@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Meeting DB (docker)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "meet",
+      "Username": "meet",
+      "SSLMode": "prefer",
+      "Comment": "PostgreSQL service of docker-compose.yml. Host is the Compose service name, not localhost. Change MaintenanceDB/Username here if you changed POSTGRES_DB/POSTGRES_USER in .env."
+    }
+  }
+}

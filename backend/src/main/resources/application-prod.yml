@@ -1,0 +1,15 @@
+# Production. Activate with SPRING_PROFILES_ACTIVE=prod. Values here are fixed on purpose: they ignore the
+# convenience switches (APP_COOKIE_SECURE, APP_REQUIRE_EMAIL_VERIFICATION, APP_OPENAPI_ENABLED, APP_STORAGE_TYPE).
+app:
+  security:
+    cookie-secure: true
+  auth:
+    require-email-verification: true
+  storage:
+    type: s3
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

@@ -1,0 +1,1292 @@
+================================================================================
+MEETING APPLICATION (meet-platform / "Meetly") - TECHNICAL AUDIT REPORT
+Linux production deployment: technology, dependency and risk inventory
+================================================================================
+
+Project root : C:\Users\E15071\Desktop\Meeting
+Audit date   : 31 Oct 2026
+Mode         : READ-ONLY. No application code or configuration was changed,
+               nothing was installed, upgraded or deployed. This TXT file is the
+               only file created by the audit.
+Secrets      : No secret values are included. The real .env files were read for
+               variable NAMES only.
+Markers      : [UNKNOWN]   = could not be verified from the project files
+               [EVIDENCE]  = file that proves the finding (paths relative to the
+                             project root unless they start with ~ or %)
+               Backend Java paths are abbreviated: ".../" means
+               backend/src/main/java/com/example/meetplatform/
+
+CONTENTS
+  0. Summary and launch blockers
+  1. Technology stack
+  2. Software and tools inventory (exact versions)
+  3. Dependency list (backend and frontend libraries)
+  4. Architecture overview
+  5. Docker and infrastructure
+  6. Environment variables
+  7. Build, startup and test commands
+  8. Build and test results (actually executed)
+  9. Linux deployment requirements (packages, ports, firewall, SSL, proxy,
+     storage, persistence, backups)
+ 10. Security and production risks
+ 11. Deployment prerequisites
+ 12. Unknown / unverified items
+
+
+================================================================================
+0. SUMMARY AND LAUNCH BLOCKERS
+================================================================================
+
+Frontend      React 19.1.1 + TypeScript 5.9.2, built by Vite 7.1.3, served by
+              nginx 1.27 (Docker).
+Backend       Spring Boot 4.0.9 on Java 21 - one modular-monolith REST API.
+Database      PostgreSQL 17 (Docker image), schema managed by Flyway (V1..V9).
+Cache         Redis 7.4 (rate limits, job locks, room signal numbers; LiveKit).
+Media         LiveKit SFU 1.13.11 (WebRTC) + LiveKit Egress 1.15.0 (recording).
+Storage       S3-compatible object storage (MinIO) + a local disk folder for
+              speaking clips.
+Real-time     No application WebSocket server. LiveKit signalling WebSocket and
+              LiveKit data channel carry all real-time updates.
+Deployment    Docker Compose: 10 services + 3 optional observability services.
+WebRTC model  SFU (self-hosted LiveKit). Not P2P, not MCU, not a third-party
+              media provider.
+
+BLOCKERS before a Linux production launch:
+  B1. No HTTPS anywhere in the stack. Browsers only allow camera/microphone on
+      HTTPS (or localhost). A TLS reverse proxy is required for the web app,
+      the API and the LiveKit WebSocket.
+      [EVIDENCE] docker-compose.yml (web 3000:80, livekit 7880, minio 9000),
+                 web/nginx.conf (listen 80 only)
+  B2. LiveKit advertises 127.0.0.1 for media by default (LIVEKIT_NODE_IP
+      default 127.0.0.1, use_external_ip: false). Remote users get no
+      audio/video until the server's public IP is set.
+      [EVIDENCE] docker-compose.yml service livekit (LIVEKIT_CONFIG)
+  B3. Windows paths are the defaults: DATA_ROOT defaults to D:/meetly/docker.
+      On Linux set it to e.g. /srv/meetly.
+      [EVIDENCE] docker-compose.yml (6 bind mounts), .env.example
+  B4. The production Spring profile is never activated: Compose does not pass
+      SPRING_PROFILES_ACTIVE, and .env.example holds development values
+      (APP_COOKIE_SECURE=false, APP_OPENAPI_ENABLED=true, SMTP_HOST=mailpit).
+      [EVIDENCE] docker-compose.yml service backend, .env.example,
+                 backend/src/main/resources/application-prod.yml
+  B5. No TURN server configured. Users behind strict firewalls will fail to
+      connect media.
+      [EVIDENCE] docker-compose.yml (no "turn:" block), docs/07-deployment.md
+
+
+================================================================================
+1. TECHNOLOGY STACK
+================================================================================
+
+1.1 Frontend framework
+    React 19.1.1, React DOM 19.1.1, React Router 7.18.4,
+    TanStack Query 5.85.5, LiveKit React components 2.9.14,
+    Tailwind CSS 4.1.12, Radix UI 1.4.3, react-hook-form 7.62.0, zod 4.6.7
+    [EVIDENCE] web/package.json
+
+1.2 Backend framework
+    Spring Boot 4.0.9 (spring-boot-starter-parent). Starters: webmvc,
+    validation, security, oauth2-resource-server, oauth2-client, data-jpa,
+    flyway, data-redis, mail, actuator, opentelemetry.
+    [EVIDENCE] backend/pom.xml
+
+1.3 Programming languages
+    Java 21                [EVIDENCE] backend/pom.xml <java.version>21,
+                                      backend/Dockerfile (eclipse-temurin:21)
+    TypeScript 5.9.2       [EVIDENCE] web/package.json
+    Kotlin 2.3.0 (runtime only, required by the LiveKit server SDK)
+                           [EVIDENCE] backend/pom.xml <kotlin.version>
+    SQL (PostgreSQL dialect, Flyway migrations V1..V9)
+                           [EVIDENCE] backend/src/main/resources/db/migration/
+
+1.4 Database
+    PostgreSQL 17 (image postgres:17-alpine). JDBC driver version managed by
+    the Spring Boot BOM (42.7.14 seen in the local Maven cache).
+    Local development PC used PostgreSQL 14.22 (outside the project).
+    [EVIDENCE] docker-compose.yml service postgres, backend/pom.xml,
+               ~/.meet-tools/pg (local only)
+
+1.5 Cache technologies
+    Redis 7.4 (image redis:7.4-alpine). Used for API rate-limit counters,
+    scheduled-job locks, per-room signal sequence numbers, and by LiveKit and
+    Egress for coordination. No other cache (no Caffeine/Ehcache/Memcached).
+    [EVIDENCE] docker-compose.yml service redis,
+               .../common/security/RateLimiter.java,
+               .../common/scheduling/JobLock.java,
+               .../media/service/RoomSequence.java
+
+1.6 Authentication and authorization
+    - Spring Security; API is an OAuth2 resource server validating JWT access
+      tokens signed with HS256 (shared secret APP_JWT_SECRET), TTL 15 min.
+    - Opaque refresh token (30 days) in a SameSite=Strict cookie scoped to
+      /api/v1/auth; refresh/logout also require the X-Requested-With header.
+    - E-mail/password registration with e-mail verification (48 h), password
+      reset (1 h), lockout after 10 failed logins for 15 min.
+    - Optional social login: Google and Microsoft (OAuth2/OIDC) with the
+      "oauth" Spring profile.
+    - Roles: USER, SYSTEM_ADMIN. Meeting guests authenticate with a
+      per-participant secret header X-Participant-Token.
+    [EVIDENCE] .../common/security/SecurityConfig.java,
+               .../common/security/JwtService.java,
+               backend/src/main/resources/application.yml (app.security,
+               app.auth), backend/src/main/resources/application-oauth.yml
+
+1.7 WebSocket / real-time communication
+    No application WebSocket server (no spring-boot-starter-websocket, no
+    STOMP, no SSE). Real-time updates use the LiveKit signalling WebSocket and
+    the LiveKit data channel. Server-published topics: chat, moderation,
+    recording, files, hand, reactions, presence.
+    livekit-client 2.15.5 (browser), io.livekit:livekit-server 0.16.0 (API).
+    [EVIDENCE] .../media/service/RoomSignals.java, backend/pom.xml,
+               web/package.json
+
+1.8 WebRTC / media technologies
+    LiveKit server (SFU) v1.13.11, LiveKit Egress v1.15.0 (composite
+    recordings via headless Chrome), browser MediaRecorder (speaking clips and
+    local recordings).
+    [EVIDENCE] docker-compose.yml services livekit, egress;
+               web/src/pages/room/MeetingRoomPage.tsx;
+               web/src/pages/room/useSpeechRecorder.ts;
+               web/src/lib/recorder/localRecorder.ts
+
+1.9 File and recording storage
+    - S3-compatible object storage through the MinIO Java SDK 8.6.0; MinIO
+      server image pgsty/minio:RELEASE.2026-08-04T00-00-00Z. Buckets:
+      meet-recordings (composite MP4), meet-files (shared files).
+    - Local filesystem folder for speaking clips (RECORDING_STORAGE_PATH).
+    - Dev profile only: both buckets on local disk (APP_STORAGE_TYPE=local).
+    [EVIDENCE] backend/pom.xml, docker-compose.yml service minio,
+               backend/src/main/resources/application.yml (app.storage,
+               app.speech-recordings), application-dev.yml,
+               .../recording/service/SpeechClipStorage.java
+
+1.10 Third-party APIs and external services
+    - Google OAuth/OIDC sign-in (optional)
+    - Microsoft Entra ID OAuth/OIDC sign-in (optional)
+      (login.microsoftonline.com endpoints)
+    - Google Calendar and Microsoft calendar sync (optional)
+    - SMTP mail server (required for verification/reset e-mails)
+    No payment, SMS, analytics or hosted media provider found.
+    [EVIDENCE] backend/src/main/resources/application-oauth.yml,
+               application.yml (app.calendar, spring.mail),
+               .../calendar/adapter/
+
+
+================================================================================
+2. SOFTWARE AND TOOLS INVENTORY
+================================================================================
+Legend: Required = needed to run the application; Build = needed to build;
+        Dev = development/testing only.
+
+Name: Docker Engine
+  Version : minimum [UNKNOWN] (BuildKit required: "# syntax=docker/dockerfile:1"
+            and "RUN --mount=type=cache")
+  Purpose : runs every service
+  Status  : Required (supported deployment path) | Prod + Build
+  Evidence: docker-compose.yml, backend/Dockerfile, web/Dockerfile
+
+Name: Docker Compose (v2 plugin)
+  Version : minimum [UNKNOWN] (file uses "secrets: environment:",
+            "bind: create_host_path", "deploy.resources.limits")
+  Purpose : orchestrates the stack
+  Status  : Required | Prod
+  Evidence: docker-compose.yml
+
+Name: Java - Eclipse Temurin
+  Version : 21 (images 21-jdk-alpine for build, 21-jre-alpine for runtime;
+            local PC 21.0.12)
+  Purpose : build and run the API
+  Status  : Required | Build (JDK) + Prod (JRE)
+  Evidence: backend/Dockerfile, backend/pom.xml
+
+Name: Apache Maven (Maven Wrapper)
+  Version : Maven 3.9.16, wrapper 3.3.4
+  Purpose : backend build and tests
+  Status  : Required to build | Build
+  Evidence: backend/.mvn/wrapper/maven-wrapper.properties
+
+Name: Node.js
+  Version : >= 20.19 (package.json engines); Docker build image node:24-alpine;
+            CI Node 24; local PC 24.15.0
+  Purpose : build the web app (not needed at runtime)
+  Status  : Required to build | Build
+  Evidence: web/package.json, web/Dockerfile, .github/workflows/ci.yml
+
+Name: npm
+  Version : bundled with Node (package-lock.json lockfileVersion 3)
+  Purpose : npm ci from lockfile
+  Status  : Required to build | Build
+  Evidence: web/package-lock.json, web/Dockerfile
+
+Name: yarn / pnpm / Gradle / Python
+  Status  : NOT USED (no yarn.lock, pnpm-lock.yaml, build.gradle,
+            requirements.txt in the project)
+
+Name: PostgreSQL
+  Version : 17 (postgres:17-alpine). Local dev PC: 14.22
+  Purpose : primary database; pg_dump in the pg-backup container
+  Status  : Required | Prod
+  Evidence: docker-compose.yml services postgres, pg-backup
+
+Name: Redis
+  Version : 7.4 (redis:7.4-alpine)
+  Purpose : rate limits, job locks, room signal numbers; LiveKit/Egress
+  Status  : Required with Docker (a single API instance can run without it:
+            APP_COORDINATION_STORE=memory) | Prod
+  Evidence: docker-compose.yml service redis, application.yml app.coordination,
+            application-dev.yml
+
+Name: MinIO (S3-compatible object storage)
+  Version : pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+  Purpose : composite recordings and shared files (any S3 can replace it)
+  Status  : Required unless an external S3 is used | Prod
+  Evidence: docker-compose.yml service minio
+
+Name: LiveKit server (SFU)
+  Version : v1.13.11 (livekit/livekit-server); local PC binary 1.13.11
+  Purpose : WebRTC media routing, signalling, data channel, webhooks
+  Status  : Required | Prod
+  Evidence: docker-compose.yml service livekit
+
+Name: LiveKit Egress
+  Version : v1.15.0 (livekit/egress)
+  Purpose : whole-meeting (composite) recordings to S3
+  Status  : Optional (only for composite recordings) | Prod
+  Evidence: docker-compose.yml service egress
+
+Name: nginx
+  Version : 1.27-alpine
+  Purpose : serves the SPA; proxies /api/, /oauth2/, /login/oauth2/ to the API
+  Status  : Required | Prod
+  Evidence: web/Dockerfile, web/nginx.conf
+
+Name: TLS reverse proxy (Caddy shown as example)
+  Version : not pinned
+  Purpose : HTTPS termination for web, API, LiveKit, S3 endpoint
+  Status  : Required in production; NOT included in docker-compose.yml
+  Evidence: docs/07-deployment.md "Reverse proxy (Caddy example)"
+
+Name: pgAdmin 4
+  Version : dpage/pgadmin4:9.18.0
+  Purpose : database web UI
+  Status  : Optional | Dev/admin (do not expose in production)
+  Evidence: docker-compose.yml service pgadmin, docker/pgadmin/servers.json
+
+Name: Mailpit
+  Version : axllent/mailpit:v1.32.0
+  Purpose : catches outgoing e-mail locally
+  Status  : Optional | Dev (replace with a real SMTP server in production)
+  Evidence: docker-compose.yml service mailpit, .env.example
+
+Name: Prometheus
+  Version : prom/prometheus:v3.15.1
+  Purpose : metrics and alert rules
+  Status  : Optional (compose profile "observability") | Prod ops
+  Evidence: docker-compose.yml, infra/prometheus/prometheus.yml,
+            infra/prometheus/alerts.yml
+
+Name: Grafana
+  Version : grafana/grafana:13.2.5
+  Purpose : dashboards
+  Status  : Optional | Prod ops
+  Evidence: docker-compose.yml,
+            infra/grafana/provisioning/datasources/datasources.yml
+
+Name: Jaeger
+  Version : jaegertracing/jaeger:2.22.0
+  Purpose : distributed tracing (OTLP)
+  Status  : Optional | Prod ops
+  Evidence: docker-compose.yml, application.yml management.opentelemetry
+
+Name: FFmpeg
+  Status  : NOT USED (not referenced anywhere in the project)
+
+Name: Coturn / separate TURN server
+  Status  : NOT USED. docs propose LiveKit's built-in TURN, but it is not
+            configured. Recommended for production (see risks).
+  Evidence: docs/07-deployment.md, docker-compose.yml
+
+Name: Playwright
+  Version : @playwright/test 1.55.0
+  Purpose : browser end-to-end tests (web/e2e, live suite with E2E_LIVE=1)
+  Status  : Optional | Dev
+  Evidence: web/package.json, web/e2e/
+
+Name: Vitest / Testing Library / jsdom
+  Version : vitest 3.2.4, @testing-library/react 16.3.0, jsdom 26.1.0
+  Purpose : web unit tests
+  Status  : Optional | Dev
+  Evidence: web/package.json, web/vite.config.ts
+
+Name: ESLint / typescript-eslint
+  Version : 9.34.0 / 8.41.0
+  Purpose : lint
+  Status  : Optional | Dev
+  Evidence: web/package.json
+
+Name: Testcontainers / embedded-postgres (io.zonky)
+  Version : Boot BOM / 2.2.2
+  Purpose : backend integration tests (Docker, or real PostgreSQL binaries)
+  Status  : Optional | Dev
+  Evidence: backend/pom.xml
+
+Name: k6
+  Version : not pinned
+  Purpose : API load test
+  Status  : Optional | Dev
+  Evidence: loadtest/api-join.js
+
+Name: LiveKit CLI (lk)
+  Version : >= 2.x
+  Purpose : media load test
+  Status  : Optional | Dev
+  Evidence: loadtest/run-media-load.sh
+
+Name: GitHub Actions, Trivy, Gitleaks
+  Version : aquasecurity/trivy-action 0.28.0, gitleaks/gitleaks-action v2,
+            actions/setup-java@v4 (Temurin 21), actions/setup-node@v4 (Node 24)
+  Purpose : CI build/test, vulnerability scan, secret scan
+  Status  : Optional | CI
+  Evidence: .github/workflows/ci.yml
+
+Name: PowerShell / Windows batch scripts
+  Purpose : local Windows start and Docker helpers
+  Status  : NOT for Linux | Dev (Windows)
+  Evidence: start-local.ps1, scripts/*.bat
+
+
+================================================================================
+3. DEPENDENCY LIST (EXACT VERSIONS)
+================================================================================
+
+3.1 Backend - direct Maven dependencies   [EVIDENCE] backend/pom.xml
+  Parent: org.springframework.boot:spring-boot-starter-parent 4.0.9
+
+  compile  spring-boot-starter-webmvc ...................... BOM (4.0.9)
+  compile  spring-boot-starter-validation .................. BOM
+  compile  spring-boot-starter-security .................... BOM
+  compile  spring-boot-starter-oauth2-resource-server ...... BOM
+  compile  spring-boot-starter-oauth2-client ............... BOM
+  compile  spring-boot-starter-data-jpa .................... BOM
+  compile  spring-boot-starter-flyway ...................... BOM
+  compile  org.flywaydb:flyway-database-postgresql ......... BOM
+  runtime  org.postgresql:postgresql ....................... BOM (42.7.14 in
+                                                             local cache)
+  compile  spring-boot-starter-data-redis .................. BOM
+  compile  spring-boot-starter-mail ........................ BOM
+  compile  spring-boot-starter-actuator .................... BOM
+  compile  io.micrometer:micrometer-registry-prometheus .... BOM
+  compile  spring-boot-starter-opentelemetry ............... BOM
+  compile  org.springdoc:springdoc-openapi-starter-webmvc-ui 3.0.3
+  compile  io.livekit:livekit-server ....................... 0.16.0
+  compile  io.minio:minio .................................. 8.6.0
+  compile  com.squareup.okhttp3:okhttp-jvm ................. 5.3.2
+  compile  org.mnode.ical4j:ical4j ......................... 4.2.3
+  (Kotlin stdlib pinned to 2.3.0 via kotlin.version)
+  test     spring-boot-starter-test, spring-boot-starter-webmvc-test,
+           spring-security-test, spring-boot-testcontainers,
+           testcontainers-postgresql, testcontainers-junit-jupiter .. BOM
+  test     io.zonky.test:embedded-postgres ................. 2.2.2
+  Build plugins: spring-boot-maven-plugin, maven-compiler-plugin (BOM)
+
+  Transitive versions resolved by the BOM: [UNKNOWN] (mvn dependency:tree was
+  not run during this read-only audit).
+
+3.2 Frontend - runtime dependencies (shipped to browsers)
+    [EVIDENCE] web/package.json
+  @hookform/resolvers 5.9.2        @livekit/components-react 2.9.14
+  @livekit/components-styles 1.1.6 @tanstack/react-query 5.85.5
+  class-variance-authority 0.7.1   clsx 2.1.1
+  livekit-client 2.15.5            lucide-react 0.541.0
+  radix-ui 1.4.3                   react 19.1.1
+  react-dom 19.1.1                 react-hook-form 7.62.0
+  react-router 7.18.4              sonner 2.0.7
+  tailwind-merge 3.3.1             zod 4.6.7
+
+3.3 Frontend - dev dependencies (build/test only)
+  @eslint/js 9.34.0                @playwright/test 1.55.0
+  @tailwindcss/vite 4.1.12         @testing-library/jest-dom 6.8.0
+  @testing-library/react 16.3.0    @testing-library/user-event 14.6.1
+  @types/node 24.3.0               @types/react 19.1.12
+  @types/react-dom 19.1.9          @vitejs/plugin-react 5.0.2
+  eslint 9.34.0                    eslint-plugin-react-hooks 5.2.0
+  eslint-plugin-react-refresh 0.4.20  globals 16.3.0
+  jsdom 26.1.0                     tailwindcss 4.1.12
+  typescript 5.9.2                 typescript-eslint 8.41.0
+  vite 7.1.3                       vitest 3.2.4
+  Total packages in web/package-lock.json (incl. transitive): 489
+
+3.4 Container images (exact tags)   [EVIDENCE] docker-compose.yml, Dockerfiles
+  postgres:17-alpine                      (postgres, pg-backup)
+  dpage/pgadmin4:9.18.0
+  redis:7.4-alpine
+  pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+  axllent/mailpit:v1.32.0
+  livekit/livekit-server:v1.13.11
+  livekit/egress:v1.15.0
+  prom/prometheus:v3.15.1                 (profile observability)
+  grafana/grafana:13.2.5                  (profile observability)
+  jaegertracing/jaeger:2.22.0             (profile observability)
+  eclipse-temurin:21-jdk-alpine           (backend build stage)
+  eclipse-temurin:21-jre-alpine           (backend runtime)
+  node:24-alpine                          (web build stage)
+  nginx:1.27-alpine                       (web runtime)
+  Note: the minor-version tags (e.g. 17-alpine, 1.27-alpine, 21-jre-alpine)
+  float; rebuilding later can pull newer patch releases.
+
+
+================================================================================
+4. ARCHITECTURE OVERVIEW
+================================================================================
+
+4.0 Topology (as defined by docker-compose.yml and web/nginx.conf)
+
+  Browser (React SPA)
+    | HTTPS /                -> web: nginx (static SPA)
+    | HTTPS /api, /oauth2    -> web nginx -> backend: Spring Boot API :8080
+    |                                          | JDBC  -> PostgreSQL 17
+    |                                          | Redis -> Redis 7.4
+    |                                          | S3    -> MinIO :9000
+    |                                          | disk  -> RECORDING_STORAGE_PATH
+    |                                          | SMTP  -> mail server
+    |                                          +-> LiveKit server API (tokens,
+    |                                              moderation, data signals)
+    | WSS signalling         -> livekit :7880 --webhooks--> API
+    |                           (POST /api/v1/webhooks/livekit, signed)
+    | WebRTC media UDP 50000-50100 / TCP 7881 <-> livekit (SFU)
+    |                           livekit --Redis--> egress (headless Chrome)
+    |                                              -> MinIO bucket
+    | presigned HTTPS GET    -> MinIO :9000 (recordings, shared files)
+
+  [EVIDENCE] docker-compose.yml, web/nginx.conf, docs/02-architecture.md,
+             docs/07-deployment.md
+
+4.1 Frontend architecture
+  - Single-page app (React 19 + TypeScript) compiled by Vite to static files
+    (web/dist) and served by nginx.
+  - React Router 7 for pages; TanStack Query for server data; react-hook-form
+    + zod for forms; Radix UI primitives + Tailwind CSS 4 for UI.
+  - Layout: web/src/pages/ (dashboard, meetings, room, recordings, scheduling,
+    settings, admin, auth, public booking), web/src/lib/api/ (REST client and
+    endpoint definitions), web/src/lib/auth/, web/src/lib/recorder/,
+    web/src/components/.
+  - API base URL baked in at build time (VITE_API_BASE_URL, default /api/v1,
+    same origin). In development, Vite proxies /api, /oauth2/,
+    /login/oauth2/, /swagger-ui, /v3/api-docs to the API.
+  [EVIDENCE] web/package.json, web/vite.config.ts, web/Dockerfile, web/src/
+
+4.2 Backend architecture
+  - One Spring Boot application ("modular monolith", 194 Java source files).
+    Feature modules under .../ : administration, analytics, booking, calendar,
+    chat, common, dashboard, file, identity, media, meeting, moderation,
+    notification, organization, participant, recording, room, scheduling.
+    Each module has controller / service / repository / entity layers.
+  - REST + JSON with RFC 7807 problem details; Java 21 virtual threads on;
+    graceful shutdown; Tomcat max 200 threads; multipart limit 25 MB.
+  - Scheduled jobs (notification dispatch, recording reconciliation,
+    speaking-clip recovery) are serialised across instances with a Redis lock.
+  - Health: /actuator/health/liveness, /actuator/health/readiness (db + redis).
+    Metrics: /actuator/prometheus behind HTTP Basic
+    (prometheus:<APP_METRICS_SCRAPE_PASSWORD>); closed when unset.
+  [EVIDENCE] backend/src/main/resources/application.yml (spring.threads,
+             server, management), .../common/scheduling/JobLock.java,
+             .../recording/service/SpeechRecordingRecovery.java,
+             .../common/security/SecurityConfig.java
+
+4.3 Database architecture
+  - PostgreSQL; schema owned by Flyway migrations V1__baseline.sql ..
+    V9__speech_recordings.sql. Hibernate only validates (ddl-auto: validate).
+    Migrations run automatically at API startup.
+  - 34 tables, including: users, user_credentials, user_sessions,
+    verification_tokens, roles, permissions, organizations,
+    organization_members, meetings, meeting_rooms, meeting_participants,
+    meeting_invitations, chat_messages, file_metadata, recordings,
+    recording_access_logs, speech_recordings, speaker_stats,
+    speaker_stat_batches, bookings, booking_pages, availability_rules,
+    availability_exceptions, availability_schedules, calendar_connections,
+    calendar_oauth_states, external_identity_links, notifications, audit_logs,
+    webhook_events, idempotency_records, login_failures.
+  - Database time zone set to UTC on first creation
+    (docker/postgres/init/01-init.sql); JDBC also uses UTC.
+  - HikariCP pool: max 20 (DB_POOL_SIZE), connection timeout 5 s.
+  [EVIDENCE] backend/src/main/resources/db/migration/, application.yml
+             (spring.flyway, spring.jpa, spring.datasource),
+             docker/postgres/init/01-init.sql, docs/03-database-erd.md,
+             table list read from the local database (information_schema)
+
+4.4 Authentication flow
+  1. Register with e-mail + password; e-mail verification required by default.
+     Optional Google/Microsoft sign-in with the "oauth" profile; the proxy must
+     route /oauth2/ and /login/oauth2/ to the backend.
+  2. Login -> access token (JWT HS256, 15 min) used as
+     "Authorization: Bearer <token>".
+  3. Refresh token (opaque, 30 days) in a SameSite=Strict, Secure cookie
+     scoped to /api/v1/auth; /auth/refresh and /auth/logout also require the
+     X-Requested-With header (CSRF protection without tokens).
+  4. Brute-force protection: 10 failures -> 15 min lockout; per-client failure
+     tracking; Redis-backed rate limits.
+  5. Authorization: /api/v1/admin/** requires SYSTEM_ADMIN; an explicit list of
+     anonymous routes (meeting join, public booking, webhooks, signed file
+     URLs); everything else requires a valid JWT. Guests use
+     X-Participant-Token, checked inside the services.
+  [EVIDENCE] .../common/security/SecurityConfig.java,
+             .../common/security/JwtService.java, application.yml app.auth /
+             app.security, application-oauth.yml,
+             db/migration/V5__login_failures_per_client.sql
+
+4.5 Meeting creation and joining flow
+  1. A signed-in host creates a meeting (scheduled, instant or personal room)
+     through the REST API and receives a join code and link (/j/<code>).
+  2. A participant opens the link; the meeting is looked up by code
+     (GET /api/v1/meetings/by-code/*, public). Guests enter a name.
+  3. POST /api/v1/meetings/{id}/join enforces waiting room, lock, password
+     and capacity (default 100, hard max 300).
+  4. On admission the API returns a LiveKit access token (TTL 10 min) and the
+     LiveKit WebSocket URL (LIVEKIT_PUBLIC_URL).
+  5. The browser connects with <LiveKitRoom>. LiveKit reports joins/leaves to
+     the API through signed webhooks; the API stores presence and history.
+  6. "Host and self only" (webinar-style) meetings put each attendee in an
+     audience room of their own; moderators get extra tokens via
+     GET /api/v1/meetings/{id}/audience-access.
+  [EVIDENCE] docs/04-api-contracts.md, .../common/security/SecurityConfig.java,
+             .../media/service/MediaService.java,
+             .../media/webhook/LiveKitWebhookController.java,
+             web/src/pages/room/JoinFlow.tsx,
+             web/src/pages/room/MeetingRoomPage.tsx,
+             web/src/pages/room/useAudienceRoom.ts,
+             application.yml app.livekit, app.meetings
+
+4.6 Real-time communication architecture
+  - No application WebSocket server.
+  - Server -> clients: LiveKit data channel. Only the server publishes (through
+    the LiveKit server API) on the topics chat, moderation, recording, files,
+    hand, reactions, presence. Messages carry sequence numbers so clients
+    detect gaps and reload room state. Delivery is best-effort and happens
+    after the database transaction commits.
+  - Clients -> server: REST calls (chat messages, raise hand, reactions).
+  [EVIDENCE] .../media/service/RoomSignals.java, backend/pom.xml (no websocket
+             starter), .../common/security/SecurityConfig.java
+
+4.7 Audio/video transmission architecture
+  VERDICT: SFU (self-hosted LiveKit). Not peer-to-peer, not MCU, not a
+  third-party media provider.
+  - Each browser publishes its tracks once to the LiveKit SFU, which forwards
+    them to the other participants. Media never passes through the API.
+  - Signalling: WebSocket to LiveKit port 7880 (ws:// in compose; must be
+    wss:// in production).
+  - Media: UDP 50000-50100; TCP fallback 7881; no TURN configured.
+  - Voice-activity detection ("who is speaking") is done by LiveKit with the
+    "audio:" settings (active_level 35, min_percentile 40,
+    update_interval 400 ms, smooth_intervals 2).
+  [EVIDENCE] docker-compose.yml service livekit; docs/02-architecture.md
+             (line 22 "LK[LiveKit SFU]", line 53 "Browsers exchange media with
+             the SFU"); loadtest/run-media-load.sh ("against the SFU");
+             web/package.json (livekit-client 2.15.5)
+
+4.8 Recording architecture (three independent kinds)
+  a) Whole-meeting (composite) "cloud" recording
+     The API asks LiveKit to start an Egress job; Egress renders the room in
+     headless Chrome and uploads an MP4 to the S3 bucket S3_RECORDINGS_BUCKET
+     at recordings/<meetingId>/<recordingId>.mp4. Can start automatically
+     ("Record automatically"). Retention: 90 days by default.
+     [EVIDENCE] docker-compose.yml services egress, minio;
+                .../recording/service/RecordingService.java,
+                .../recording/service/AutoRecordingService.java;
+                application.yml app.recording
+     NOTE: on the development PC every composite recording failed ("The media
+     server is unavailable") because no Egress worker runs there. This path
+     is NOT verified end to end.
+  b) Speaking clips
+     Each participant's browser records its own microphone (+camera when on)
+     per speaking turn with MediaRecorder and uploads 1-second chunks. The
+     server names, writes (.part), verifies (WebM/EBML header) and finalises
+     each file under
+       RECORDING_STORAGE_PATH/DD-MM-YYYY/<Meeting_Title>/<Participant_Name>/
+         DDMMYYHHmmss_<6 hex>.webm
+     Files are served through 10-minute HMAC-signed URLs after an access
+     check; access is audited. A recovery job closes abandoned clips.
+     [EVIDENCE] web/src/pages/room/useSpeechRecorder.ts,
+                .../recording/service/SpeechRecordingService.java,
+                .../recording/service/SpeechClipStorage.java,
+                db/migration/V9__speech_recordings.sql
+  c) Local recording
+     The user records the meeting tab with getDisplayMedia + MediaRecorder;
+     the file is downloaded to their own device. The API only records that it
+     started (POST /api/v1/meetings/*/local-recordings).
+     [EVIDENCE] web/src/lib/recorder/localRecorder.ts,
+                .../common/security/SecurityConfig.java
+
+4.9 File storage architecture
+  - Meeting file sharing: uploads up to 25 MB; allow-listed types (PDF, PNG,
+    JPEG, GIF, WebP, text, CSV, DOCX, XLSX, PPTX, ZIP); stored in S3 bucket
+    S3_FILES_BUCKET (default meet-files); downloads by presigned URL valid
+    15 min built with S3_PUBLIC_ENDPOINT.
+  - The API creates the buckets at startup.
+  - Dev profile only: APP_STORAGE_TYPE=local keeps the buckets on disk
+    (D:/meetly) and serves them via /api/v1/storage/local with an HMAC
+    signature.
+  [EVIDENCE] application.yml (app.files, app.storage), application-dev.yml,
+             .../common/storage/LocalFileObjectStorage.java,
+             docker-compose.yml (minio comment)
+
+
+================================================================================
+5. DOCKER AND INFRASTRUCTURE
+================================================================================
+[EVIDENCE] docker-compose.yml, backend/Dockerfile, web/Dockerfile,
+           web/nginx.conf
+
+5.1 General
+  - Compose project name: meet-platform
+  - Network: one bridge network "meet-platform-net"; services reach each
+    other by service name (postgres, redis, minio, livekit, backend, ...).
+  - Every service: restart unless-stopped; logging json-file, max-size 10m,
+    max-file 3.
+  - Secrets: "metrics_scrape_password" from the environment variable
+    APP_METRICS_SCRAPE_PASSWORD (used by Prometheus).
+
+5.2 Services
+  postgres    image postgres:17-alpine
+              ports 127.0.0.1:${POSTGRES_PORT:-5432}:5432
+              volume pgdata:/var/lib/postgresql/data;
+              ./docker/postgres/init -> /docker-entrypoint-initdb.d (ro)
+              healthcheck pg_isready over TCP (5 s interval, 20 retries)
+              limits 2 CPU / 2 GB
+  pg-backup   image postgres:17-alpine; depends on postgres healthy
+              bind ${DATA_ROOT:-D:/meetly/docker}/backups -> /backups
+              command: pg_dump -Fc every 24 h, keeps 14 days
+              no healthcheck; limits 0.5 CPU / 256 MB
+  pgadmin     image dpage/pgadmin4:9.18.0; depends on postgres healthy
+              ports 127.0.0.1:${PGADMIN_PORT:-5050}:80
+              volume pgadmindata; servers.json (ro); master password disabled
+              no healthcheck; limits 1 CPU / 512 MB
+  redis       image redis:7.4-alpine; --requirepass, --appendonly yes
+              ports 127.0.0.1:6379:6379
+              bind ${DATA_ROOT}/redis -> /data
+              healthcheck redis-cli ping
+  minio       image pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+              command server /data --console-address :9001
+              ports 9000:9000 (ALL interfaces), 127.0.0.1:9001:9001
+              bind ${DATA_ROOT}/minio -> /data
+              no healthcheck (stated in the file)
+  mailpit     image axllent/mailpit:v1.32.0
+              ports 127.0.0.1:8025:8025, 127.0.0.1:1025:1025
+              no healthcheck
+  livekit     image livekit/livekit-server:v1.13.11; depends on redis healthy
+              config from env LIVEKIT_CONFIG: port 7880, rtc tcp 7881,
+              udp 50000-50100, use_external_ip false,
+              node_ip ${LIVEKIT_NODE_IP:-127.0.0.1}, redis, keys, webhook to
+              http://backend:8080/api/v1/webhooks/livekit, empty_timeout 300,
+              departure_timeout 20, audio VAD settings, prometheus_port 6789
+              ports 7880:7880, 7881:7881/tcp, 50000-50100:50000-50100/udp
+              (ALL interfaces); no healthcheck
+  egress      image livekit/egress:v1.15.0; depends on livekit, minio started
+              cap_add SYS_ADMIN; shm_size 1gb; limits 4 CPU / 4 GB
+              config from env EGRESS_CONFIG_BODY (ws_url ws://livekit:7880,
+              redis, s3 endpoint http://minio:9000, force_path_style,
+              health_port 9090); no healthcheck
+  backend     build ./backend; depends on postgres+redis healthy, minio started
+              expose 8080 (not published to the host)
+              env: see section 6 (RECORDING_STORAGE_PATH=/data/recordings,
+              APP_COORDINATION_STORE=redis, ...)
+              bind ${DATA_ROOT}/Recordings -> /data/recordings
+              healthcheck wget /actuator/health/readiness | grep UP
+              (10 s interval, 30 retries, start_period 40 s)
+              limits 2 CPU / 2 GB
+  web         build ./web; depends on backend healthy
+              ports 3000:80 (ALL interfaces)
+              healthcheck (Dockerfile) wget http://127.0.0.1/healthz
+  prometheus  profile observability; image prom/prometheus:v3.15.1
+              ports 127.0.0.1:9090; volume prometheusdata; retention 15 d
+  grafana     profile observability; image grafana/grafana:13.2.5
+              ports 127.0.0.1:3001:3000; volume grafanadata
+  jaeger      profile observability; image jaegertracing/jaeger:2.22.0
+              ports 127.0.0.1:16686
+
+5.3 Dockerfiles
+  backend/Dockerfile (multi-stage)
+    build : eclipse-temurin:21-jdk-alpine; ./mvnw dependency:go-offline;
+            ./mvnw package -DskipTests; extract Spring Boot layers
+    run   : eclipse-temurin:21-jre-alpine; non-root user "app";
+            EXPOSE 8080;
+            JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+            ENTRYPOINT java org.springframework.boot.loader.launch.JarLauncher
+  web/Dockerfile (multi-stage)
+    build : node:24-alpine; npm ci --no-audit --no-fund; npm run build;
+            ARG VITE_API_BASE_URL=/api/v1, ARG VITE_PUBLIC_APP_URL=
+    run   : nginx:1.27-alpine; web/nginx.conf -> conf.d/default.conf;
+            EXPOSE 80; HEALTHCHECK /healthz; CMD nginx -g "daemon off;"
+
+5.4 nginx (web/nginx.conf)
+  - listen 80 only (no TLS); server_tokens off; client_max_body_size 30m;
+    gzip on.
+  - Proxies /api/, /oauth2/, /login/oauth2/ to backend:8080 with Host,
+    X-Real-IP, X-Forwarded-For/-Proto/-Host headers.
+  - Security headers: X-Content-Type-Options nosniff, Referrer-Policy,
+    X-Frame-Options DENY, Permissions-Policy (camera/microphone/
+    display-capture self). No Content-Security-Policy, no HSTS.
+  - /assets/ cached 1 year (immutable); SPA fallback to index.html (no-cache).
+
+5.5 Persistent storage
+  Database                  named volume pgdata          BACKED UP (nightly
+                                                         pg_dump to
+                                                         ${DATA_ROOT}/backups,
+                                                         14 days, same host)
+  Recordings + files        ${DATA_ROOT}/minio           NOT backed up
+  Speaking clips            ${DATA_ROOT}/Recordings      NOT backed up
+  Redis (not authoritative) ${DATA_ROOT}/redis           not needed
+  pgAdmin/Prometheus/Grafana named volumes               not backed up
+  Legacy volumes redisdata, miniodata: declared, unused (kept so older data
+  is not orphaned).
+
+5.6 Containerised vs installed separately
+  Containerised: PostgreSQL, pg-backup, pgAdmin, Redis, MinIO, Mailpit,
+    LiveKit, Egress, API, web/nginx, Prometheus, Grafana, Jaeger.
+  Must be provided on the host / externally:
+    - Docker Engine + Compose plugin
+    - TLS reverse proxy + certificates (not in docker-compose.yml)
+    - Firewall
+    - Real SMTP service
+    - TURN (optional; LiveKit built-in TURN needs config + certificate)
+    - Off-host backup storage/tooling
+
+
+================================================================================
+6. ENVIRONMENT VARIABLES
+================================================================================
+Values are PLACEHOLDERS only. Req = must be set for production;
+Opt = has a default or enables an optional feature.
+Sources: docker-compose.yml (compose), backend/src/main/resources/
+application.yml (app), application-*.yml, web/Dockerfile, web/.env.example,
+web/vite.config.ts, .env.example.
+
+--- Public URLs -----------------------------------------------------------------
+APP_PUBLIC_URL              Req  Prod  Browser origin of the app (e-mail links,
+                                       OAuth redirects)
+                                       e.g. https://meet.example.com
+                                       [app, compose]
+APP_CORS_ALLOWED_ORIGINS    Req  Prod  Allowed browser origins (comma list)
+                                       e.g. https://meet.example.com
+                                       [app, compose]
+LIVEKIT_PUBLIC_URL          Req  Prod  WebSocket URL browsers use for LiveKit
+                                       e.g. wss://media.example.com
+                                       [app, compose]
+LIVEKIT_NODE_IP             Req  Prod  IP LiveKit advertises for media
+                                       (default 127.0.0.1)
+                                       e.g. 203.0.113.10        [compose]
+S3_PUBLIC_ENDPOINT          Req  Prod  Browser-reachable S3 URL in presigned
+                                       links  e.g. https://files.example.com
+                                       [app, compose]
+
+--- Secrets (generate >= 32 random bytes; never commit) ---------------------------
+APP_JWT_SECRET              Req  All   HMAC key for access tokens (also used to
+                                       derive clip URL signing keys)
+                                       e.g. <random-32+-bytes>  [app, compose :?]
+POSTGRES_PASSWORD           Req  All   DB password (compose -> DB_PASSWORD)
+                                       e.g. <db-password>       [compose :?]
+DB_PASSWORD                 Req* All   DB password when the API runs outside
+                                       compose  e.g. <db-password>  [app]
+REDIS_PASSWORD              Req  All   Redis password (API, LiveKit, Egress)
+                                       e.g. <redis-password>    [compose :?, app]
+LIVEKIT_API_KEY             Req  All   LiveKit API key
+                                       e.g. <livekit-key>       [compose :?, app]
+LIVEKIT_API_SECRET          Req  All   LiveKit API secret (>= 32 chars)
+                                       e.g. <livekit-secret>    [compose :?, app]
+S3_ACCESS_KEY               Req  All   Object storage access key (MinIO root
+                                       user)  e.g. <s3-access>  [compose :?, app]
+S3_SECRET_KEY               Req  All   Object storage secret key
+                                       e.g. <s3-secret>         [compose :?, app]
+PGADMIN_DEFAULT_PASSWORD    Req* Dev   pgAdmin login. The compose file requires
+                                       it (:?) even if pgAdmin is not started
+                                       e.g. <pgadmin-password>  [compose]
+APP_METRICS_SCRAPE_PASSWORD Opt  Prod  HTTP Basic password for
+                                       /actuator/prometheus (empty = closed)
+                                       e.g. <metrics-password>  [app, compose]
+APP_CALENDAR_ENCRYPTION_KEY Opt  Prod  Encrypts stored calendar OAuth tokens
+                                       (32 bytes Base64)
+                                       e.g. <base64-32-bytes>   [app, compose]
+
+--- Database ---------------------------------------------------------------------
+POSTGRES_DB                 Opt  All   DB name (first volume creation only)
+                                       e.g. meet                [compose]
+POSTGRES_USER               Opt  All   DB owner                 e.g. meet
+POSTGRES_PORT               Opt  All   Host port bound to 127.0.0.1  e.g. 5432
+DB_URL                      Req* All   JDBC URL (set by compose)
+                                       e.g. jdbc:postgresql://db-host:5432/meet
+DB_USERNAME                 Req* All   DB user (set by compose)  e.g. meet
+DB_POOL_SIZE                Opt  Prod  HikariCP max connections (default 20)
+
+--- Redis / LiveKit / storage ----------------------------------------------------
+REDIS_HOST                  Req* All   Redis host (compose: redis)  e.g. redis
+REDIS_PORT                  Opt  All   Redis port (default 6379)
+LIVEKIT_API_URL             Req* All   Internal LiveKit API
+                                       (compose: http://livekit:7880)
+S3_ENDPOINT                 Req* All   Internal S3 endpoint
+                                       (compose: http://minio:9000)
+S3_REGION                   Opt  All   S3 region (default us-east-1)
+S3_RECORDINGS_BUCKET        Opt  All   Recordings bucket (default meet-recordings)
+S3_FILES_BUCKET             Opt  All   Files bucket (default meet-files);
+                                       NOT passed by compose
+APP_STORAGE_TYPE            Opt  Dev   s3 | local (prod profile forces s3)
+APP_STORAGE_LOCAL_ROOT      Opt  Dev   Local storage root (dev: D:/meetly)
+DATA_ROOT                   Req  Prod  Host folder for MinIO, Redis, backups,
+                                       speaking clips (default D:/meetly/docker)
+                                       e.g. /srv/meetly         [compose]
+RECORDING_STORAGE_PATH      Req* All   Speaking-clip root (compose fixes it to
+                                       /data/recordings)
+                                       e.g. /srv/meetly/Recordings
+RECORDING_MIN_FREE_BYTES    Opt  Prod  Refuse clips below this free space
+                                       (default 209715200 = 200 MiB)
+
+--- Behaviour --------------------------------------------------------------------
+SPRING_PROFILES_ACTIVE      Req  All   prod | uat | dev, plus "oauth" for social
+                                       login. NOT passed by compose.
+                                       e.g. prod,oauth
+PORT                        Opt  All   API HTTP port (default 8080)
+APP_COOKIE_SECURE           Req  Prod  Secure refresh cookie; must be true
+                                       (prod profile forces true)
+APP_REQUIRE_EMAIL_VERIFICATION Opt Prod Require verified e-mail (default true)
+APP_OPENAPI_ENABLED         Opt  Dev   Swagger UI/API docs; keep false in prod
+APP_RECORDING_RETENTION_DAYS Opt Prod  Composite recording retention (90)
+APP_JWT_ISSUER              Opt  All   JWT issuer (default meet-platform)
+APP_RATE_LIMIT_ENABLED      Opt  Prod  API rate limits (default true)
+APP_COORDINATION_STORE      Opt  All   redis | memory (compose: redis)
+APP_NOTIFICATIONS_DISPATCH_ENABLED Opt All Send queued e-mails (default true)
+APP_MAIL_FROM               Req  Prod  Sender address  e.g. no-reply@example.com
+APP_HOST_DROPOUT_GRACE      Opt  All   e.g. PT20S
+APP_PRESENCE_DEBOUNCE       Opt  All   e.g. PT0.25S
+APP_RECONNECT_WINDOW        Opt  All   e.g. PT30S
+JAVA_TOOL_OPTIONS           Opt  Prod  JVM options (set in backend/Dockerfile)
+
+--- E-mail -----------------------------------------------------------------------
+SMTP_HOST                   Req  Prod  Mail server (compose default mailpit)
+                                       e.g. smtp.example.com
+SMTP_PORT                   Req  Prod  e.g. 587 (compose default 1025)
+SMTP_USERNAME               Req  Prod  e.g. <smtp-user>
+SMTP_PASSWORD               Req  Prod  e.g. <smtp-password>
+SMTP_AUTH                   Req  Prod  true
+SMTP_STARTTLS               Req  Prod  true
+
+--- Optional integrations --------------------------------------------------------
+GOOGLE_CLIENT_ID            Opt  Prod  Google sign-in (oauth profile);
+GOOGLE_CLIENT_SECRET                   NOT passed by compose
+                                       [application-oauth.yml]
+MICROSOFT_CLIENT_ID         Opt  Prod  Microsoft sign-in (oauth profile);
+MICROSOFT_CLIENT_SECRET                NOT passed by compose
+MICROSOFT_TENANT                       e.g. common
+APP_CALENDAR_CALLBACK_BASE_URL Opt Prod Public base URL for calendar OAuth
+                                       callback  e.g. https://meet.example.com
+GOOGLE_CALENDAR_CLIENT_ID   Opt  Prod  Google Calendar sync
+GOOGLE_CALENDAR_CLIENT_SECRET
+MICROSOFT_CALENDAR_CLIENT_ID Opt Prod  Microsoft calendar sync
+MICROSOFT_CALENDAR_CLIENT_SECRET
+MICROSOFT_CALENDAR_TENANT              e.g. common
+
+--- Observability / admin --------------------------------------------------------
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT Opt Prod e.g. http://jaeger:4318/v1/traces
+OTEL_SAMPLING_PROBABILITY   Opt  Prod  default 0.1 (template sets 1.0)
+PGADMIN_DEFAULT_EMAIL       Opt  Dev   e.g. admin@example.com
+PGADMIN_PORT                Opt  Dev   e.g. 5050
+
+--- Web build (baked in at npm run build) ----------------------------------------
+VITE_API_BASE_URL           Opt  Build REST base path (default /api/v1)
+VITE_PUBLIC_APP_URL         Opt  Build Origin for join/booking links
+                                       (default: page origin)
+VITE_DEV_PROXY_TARGET       Opt  Dev   Vite dev proxy target
+                                       (default http://localhost:8080)
+
+(* = required only when the API runs outside Docker Compose, which sets it.)
+
+Variables present in the real .env (names only, values not read into this
+report): APP_PUBLIC_URL, APP_CORS_ALLOWED_ORIGINS, LIVEKIT_PUBLIC_URL,
+LIVEKIT_NODE_IP, S3_PUBLIC_ENDPOINT, APP_JWT_SECRET, POSTGRES_PASSWORD,
+PGADMIN_DEFAULT_PASSWORD, REDIS_PASSWORD, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
+S3_ACCESS_KEY, S3_SECRET_KEY, APP_CALENDAR_ENCRYPTION_KEY,
+APP_METRICS_SCRAPE_PASSWORD, POSTGRES_DB, POSTGRES_USER, POSTGRES_PORT,
+PGADMIN_DEFAULT_EMAIL, PGADMIN_PORT, DATA_ROOT, S3_RECORDINGS_BUCKET,
+APP_REQUIRE_EMAIL_VERIFICATION, APP_COOKIE_SECURE, APP_OPENAPI_ENABLED,
+APP_RECORDING_RETENTION_DAYS, APP_MAIL_FROM, SMTP_HOST, SMTP_PORT,
+SMTP_USERNAME, SMTP_PASSWORD, SMTP_AUTH, SMTP_STARTTLS, GOOGLE_CLIENT_ID,
+GOOGLE_CLIENT_SECRET, MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET,
+MICROSOFT_TENANT, APP_CALENDAR_CALLBACK_BASE_URL, GOOGLE_CALENDAR_CLIENT_ID,
+GOOGLE_CALENDAR_CLIENT_SECRET, MICROSOFT_CALENDAR_CLIENT_ID,
+MICROSOFT_CALENDAR_CLIENT_SECRET, MICROSOFT_CALENDAR_TENANT,
+OTEL_SAMPLING_PROBABILITY.
+web/.env.development.local: VITE_DEV_PROXY_TARGET.
+
+
+================================================================================
+7. BUILD, STARTUP AND TEST COMMANDS (Linux shell)
+================================================================================
+These are the project's own commands. They were NOT run as part of this audit
+(see section 8 for what was executed earlier the same day on Windows).
+
+1. Frontend installation (exact versions from package-lock.json)
+     cd web
+     npm ci
+
+2. Frontend build (type-check + Vite) -> web/dist/
+     npm run build
+   or as an image:
+     docker build -t meet-platform/web ./web \
+       --build-arg VITE_API_BASE_URL=/api/v1 \
+       --build-arg VITE_PUBLIC_APP_URL=https://meet.example.com
+
+3. Backend build -> backend/target/meet-platform-0.1.0-SNAPSHOT.jar
+     cd backend
+     sh ./mvnw -B package -DskipTests
+   or as an image:
+     docker build -t meet-platform/api ./backend
+
+4. Database migration
+     Automatic: Flyway applies V1..V9 when the API starts
+     (spring.flyway.enabled: true). No separate migration command and no
+     Flyway Maven plugin are configured in this project.
+
+5. Start the application (from the project root)
+     cp .env.example .env     # set every CHANGE_ME, DATA_ROOT, public URLs
+     docker compose up -d --build
+     docker compose ps
+   API without Docker (PostgreSQL, Redis, S3, LiveKit must be reachable and
+   the environment variables set):
+     SPRING_PROFILES_ACTIVE=prod java -jar \
+       backend/target/meet-platform-0.1.0-SNAPSHOT.jar
+
+6. Background services / observability
+     docker compose up -d postgres pg-backup redis minio livekit egress
+     docker compose --profile observability up -d
+
+7. Automated tests
+     cd backend && sh ./mvnw -B verify       # unit + integration tests
+     cd web && npm run typecheck && npm run lint && npm run test
+     cd web && npx playwright test           # e2e; live suite needs
+                                             # E2E_LIVE=1 and a running stack
+     k6 run -e BASE_URL=https://meet.example.com \
+       -e USERS_FILE=users.json loadtest/api-join.js
+     sh loadtest/run-media-load.sh           # needs lk CLI + LIVEKIT_* vars
+
+[EVIDENCE] web/package.json (scripts), web/Dockerfile, backend/Dockerfile,
+           backend/.mvn/wrapper/maven-wrapper.properties, application.yml
+           (spring.flyway), docker-compose.yml (header), .github/workflows/
+           ci.yml, loadtest/
+
+
+================================================================================
+8. BUILD AND TEST RESULTS (ACTUALLY EXECUTED)
+================================================================================
+Nothing was executed during this read-only audit. The results below come from
+runs made earlier on 31 Oct 2026 in this working session, on the Windows
+development PC (no Docker), after the latest code changes (speaking-clip QA
+fixes RC-1, RC-2, RC-4, RC-5 and the dashboard/recordings page changes).
+
+  Backend: mvnw test (full suite)          PASS  163 run, 0 failures,
+                                                  0 errors, 1 skipped
+  Backend: SpeechClipStorageTest           PASS  15/15
+  Backend: SpeechRecordingIntegrationTest  PASS  6/6
+  Web: npm run typecheck                   PASS
+  Web: npm run lint                        PASS  (exit code 0)
+  Web: vitest run (full suite)             PASS  186/186 tests, 28 files
+  Web: npm run build                       PASS
+  Live e2e 06-speech-clips.spec.ts         PASS  1/1 (real local stack:
+                                                  PostgreSQL 14.22, LiveKit
+                                                  1.13.11, API, web)
+  API jar rebuild (start-local.ps1 -Build) PASS  readiness UP
+  Docker image builds / docker compose     NOT RUN - BLOCKED (Docker is not
+                                                  installed on the PC)
+  Composite recording via Egress           NOT RUN - no Egress worker locally
+  Linux build/run                          NOT RUN
+  Load tests (k6, lk load-test)            NOT RUN
+
+
+================================================================================
+9. LINUX DEPLOYMENT REQUIREMENTS
+================================================================================
+
+9.1 Required packages and runtimes
+  With Docker (supported path):
+    - Docker Engine with BuildKit; Docker Compose v2 plugin
+      (minimum versions [UNKNOWN]; Compose must support
+      "secrets: environment:")
+    - Everything else runs in containers.
+  Without Docker:
+    - OpenJDK / Temurin 21 (JRE to run, JDK to build)
+    - Node.js >= 20.19 + npm (build only)
+    - PostgreSQL 17, Redis 7.4, MinIO or S3
+    - LiveKit server 1.13.11; LiveKit Egress 1.15.0 (needs Chrome +
+      GStreamer - the container image is strongly preferred)
+    - nginx 1.27 (or another web server) for the SPA
+  Both:
+    - TLS reverse proxy (Caddy, nginx or Traefik) + certbot/ACME if not Caddy
+    - curl or wget, openssl (secret generation)
+    - firewall: ufw or firewalld
+    - time sync: chrony or systemd-timesyncd (token expiry depends on clocks)
+    - off-host backup tool, e.g. rclone or restic (recommended; not
+      referenced by the project)
+  Hardware (from project files): Egress >= 4 vCPU / 4 GB per worker;
+    API 2 CPU / 2 GB; PostgreSQL 2 CPU / 2 GB (compose limits).
+    [EVIDENCE] docs/07-deployment.md, docker-compose.yml
+
+9.2 Required runtime versions
+  Java 21 | Node >= 20.19 (build) | PostgreSQL 17 | Redis 7.4 |
+  LiveKit 1.13.11 | Egress 1.15.0 | nginx 1.27
+
+9.3 Required Docker / Docker Compose versions
+  [UNKNOWN] - not stated anywhere in the project and never run on the
+  development PC. Features used: BuildKit cache mounts, Compose spec
+  "secrets: environment:", "bind: create_host_path", "deploy.resources".
+
+9.4 Network ports
+  Expose to the internet:
+    443/tcp           TLS reverse proxy (web, API, LiveKit wss, S3 endpoint)
+    80/tcp            HTTP -> HTTPS redirect, ACME challenges
+    7881/tcp          LiveKit WebRTC over TCP (fallback)
+    50000-50100/udp   LiveKit WebRTC media (101 ports; docs suggest widening
+                      to 50000-60000 for scale)
+    3478/udp, 5349/tcp TURN - only if LiveKit TURN is enabled (not today)
+  Keep internal (currently published on ALL interfaces by compose - bind to
+  127.0.0.1 or firewall them):
+    7880/tcp          LiveKit HTTP/WebSocket (put behind TLS proxy)
+    9000/tcp          MinIO S3 API (put behind TLS proxy)
+    3000/tcp          web nginx (plain HTTP; proxy target)
+  Internal only (already bound to 127.0.0.1 or not published):
+    8080 API, 5432 PostgreSQL, 6379 Redis, 9001 MinIO console, 5050 pgAdmin,
+    8025/1025 Mailpit, 9090 Prometheus, 3001 Grafana, 16686 Jaeger,
+    6789 LiveKit metrics
+  [EVIDENCE] docker-compose.yml ports, docs/07-deployment.md
+
+9.5 Firewall requirements
+  Allow inbound 80, 443, 7881/tcp, 50000-50100/udp (+ TURN ports if
+  enabled); deny all other inbound. NOTE: Docker-published ports bypass ufw
+  rules by default - bind 3000, 7880, 9000 to 127.0.0.1 or filter in the
+  DOCKER-USER iptables chain.
+
+9.6 SSL requirements
+  Certificates for the app domain (e.g. meet.example.com) and the media
+  domain (e.g. media.example.com), plus the TURN domain if used. HTTPS is
+  mandatory for camera/microphone and for the Secure refresh cookie.
+
+9.7 Reverse proxy requirements
+  - Route /api/*, /oauth2/*, /login/oauth2/* to the API (or to the web
+    nginx, which already proxies them).
+  - Route the media host to LiveKit :7880 with WebSocket upgrade.
+  - Forward Host, X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
+    (API uses server.forward-headers-strategy=native).
+  - Block /actuator/* from the internet.
+  - Allow request bodies >= 30 MB (files 25 MB; clip chunks 8 MiB).
+  [EVIDENCE] docs/07-deployment.md, web/nginx.conf, application.yml
+
+9.8 Recording storage requirements
+  - Dedicated disk/volume for ${DATA_ROOT}.
+  - Composite MP4s in MinIO (${DATA_ROOT}/minio); retention 90 days.
+  - Speaking clips in ${DATA_ROOT}/Recordings: up to 500 MiB per clip, 8 MiB
+    per chunk; new clips refused below 200 MiB free. No automatic deletion
+    of speaking clips was found.
+  - The folder must be writable by the container user "app" (non-root).
+  [EVIDENCE] application.yml app.speech-recordings, app.recording,
+             backend/Dockerfile (USER app)
+
+9.9 Database persistence requirements
+  - Named volume pgdata under /var/lib/docker/volumes: size that filesystem
+    or move Docker's data root.
+  - Never run "docker compose down -v" (deletes volumes).
+
+9.10 Backup requirements
+  - Nightly pg_dump exists but stays on the same host
+    (${DATA_ROOT}/backups, 14 days).
+  - Copy ${DATA_ROOT}/backups, ${DATA_ROOT}/minio and ${DATA_ROOT}/Recordings
+    off the server; test restores.
+  - docs recommend WAL archiving (pgBackRest/WAL-G) for point-in-time
+    recovery and bucket versioning/replication for object storage.
+  - Secrets in a secret manager with versioning.
+  [EVIDENCE] docker-compose.yml pg-backup, docs/07-deployment.md
+             "Backup and restore"
+
+
+================================================================================
+10. SECURITY AND PRODUCTION RISKS
+================================================================================
+Ordered by severity. "Open QA" = finding from the independent QA review of
+speaking-clip recording (31 Oct 2026), known and not yet fixed.
+
+[CRITICAL] R1 Missing TLS
+  Web (3000), LiveKit (7880, ws://) and MinIO (9000) are plain HTTP. Camera/
+  mic are blocked on non-HTTPS origins; refresh cookies are Secure.
+  [EVIDENCE] docker-compose.yml, web/nginx.conf
+
+[CRITICAL] R2 Media reachability
+  LiveKit node_ip defaults to 127.0.0.1, use_external_ip false.
+  [EVIDENCE] docker-compose.yml livekit, .env.example LIVEKIT_NODE_IP
+
+[CRITICAL] R3 Linux compatibility - Windows default paths
+  DATA_ROOT defaults to D:/meetly/docker for 6 bind mounts.
+  [EVIDENCE] docker-compose.yml, .env.example
+
+[HIGH] R4 Development-only configuration
+  SPRING_PROFILES_ACTIVE is not passed by compose, so application-prod.yml
+  never applies. .env.example uses APP_COOKIE_SECURE=false,
+  APP_OPENAPI_ENABLED=true, OTEL_SAMPLING_PROBABILITY=1.0, SMTP_HOST=mailpit,
+  localhost URLs.
+  [EVIDENCE] docker-compose.yml backend env, .env.example,
+             application-prod.yml
+
+[HIGH] R5 Missing environment variables in compose
+  GOOGLE_CLIENT_ID/SECRET, MICROSOFT_CLIENT_ID/SECRET, MICROSOFT_TENANT and
+  S3_FILES_BUCKET are not passed to the backend container; social sign-in
+  cannot work in Docker even when set in .env.
+  [EVIDENCE] docker-compose.yml vs application-oauth.yml, application.yml
+
+[HIGH] R6 No TURN server
+  Users behind restrictive firewalls/proxies cannot connect media.
+  [EVIDENCE] docker-compose.yml, docs/07-deployment.md
+
+[HIGH] R7 Open QA RC-3 - database pool exhaustion
+  A participant can hold DB connections while slowly uploading clip chunks.
+  [EVIDENCE] .../recording/service/SpeechRecordingService.java appendChunk
+
+[HIGH] R8 Incomplete backups
+  Recordings, shared files and speaking clips are not backed up; DB dumps
+  stay on the same host.  [EVIDENCE] docker-compose.yml pg-backup
+
+[MEDIUM] R9 Unprotected ports
+  3000, 7880, 9000 (and 7881 + UDP range, which must be public) are
+  published on all interfaces; Docker bypasses ufw. PostgreSQL, Redis,
+  pgAdmin, Mailpit and observability UIs are correctly on 127.0.0.1.
+  [EVIDENCE] docker-compose.yml ports
+
+[MEDIUM] R10 File permissions (open QA RC-13)
+  Backend runs as non-root "app"; on Linux, Compose creates
+  ${DATA_ROOT}/Recordings owned by root, so clip writes may fail.
+  [EVIDENCE] backend/Dockerfile, docker-compose.yml create_host_path
+
+[MEDIUM] R11 Horizontal scaling
+  Speaking clips live on the API's local disk; >1 API instance needs a
+  shared filesystem.
+  [EVIDENCE] application.yml app.speech-recordings, SpeechClipStorage.java
+
+[MEDIUM] R12 Open QA RC-6 / RC-7
+  A removed participant can keep uploading to an open clip; any admitted
+  participant can fill the recording disk (no per-user byte budget).
+  Other open low-severity QA items: RC-8 to RC-12.
+  [EVIDENCE] SpeechRecordingService.java, SpeechClipStorage.java
+
+[MEDIUM] R13 Missing health checks
+  None for minio, livekit, egress, mailpit, pg-backup, observability
+  services; dependants only wait for "started".  [EVIDENCE] docker-compose.yml
+
+[MEDIUM] R14 Untested composite recording path
+  Egress never succeeded on the development PC; needs a production-like
+  test. Egress runs with cap_add SYS_ADMIN.
+  [EVIDENCE] local DB: every "recordings" row FAILED; docker-compose.yml
+
+[MEDIUM] R15 Admin/dev tools in the default stack
+  pgAdmin (master password disabled) and Mailpit start with
+  "docker compose up"; leave them out in production.
+  [EVIDENCE] docker-compose.yml pgadmin, mailpit
+
+[LOW] R16 Exposed secrets
+  No secrets in committed templates (.env is in .gitignore; templates use
+  CHANGE_ME). The project is not a git repository, so the real .env sits
+  beside the code - do not copy it to the server as-is. Outside the project,
+  %USERPROFILE%\.meet-tools\start-api.ps1 (local dev launcher) contains
+  development DB and JWT secrets in plain text - never reuse them.
+  [EVIDENCE] .gitignore, .env.example, ~/.meet-tools/start-api.ps1
+
+[LOW] R17 CORS
+  Explicit allow-list with credentials (safe), defaults to
+  http://localhost:5173 / :3000 - set to the production origin only.
+  [EVIDENCE] .../common/security/SecurityConfig.java lines 207-212,
+             application.yml app.cors
+
+[LOW] R18 Hardcoded localhost
+  Only as overridable fallback defaults (DB, Redis, SMTP, LiveKit, S3, OTLP,
+  public URL). None in the frontend source.
+  [EVIDENCE] application.yml lines 8, 37, 43, 103, 123-150; web/src
+
+[LOW] R19 Information exposure
+  Production web build ships source maps (build.sourcemap: true); nginx sets
+  no Content-Security-Policy and no HSTS.
+  [EVIDENCE] web/vite.config.ts, web/nginx.conf
+
+[LOW] R20 Logging
+  stdout + Docker json-file (10 MB x 3 per container); no central log
+  shipping; level INFO.  [EVIDENCE] docker-compose.yml, application.yml
+
+[LOW] R21 Secret on command line
+  Redis password passed as a redis-server argument (visible in
+  docker inspect / host process list).  [EVIDENCE] docker-compose.yml redis
+
+[LOW] R22 Version drift
+  Local dev ran PostgreSQL 14.22; production image is 17. CI tests use 17
+  (Testcontainers); re-verify before launch.
+  [EVIDENCE] ~/.meet-tools/pg, docker-compose.yml, .github/workflows/ci.yml
+
+[LOW] R23 Supply chain
+  MinIO is a third-party rebuild (pgsty/minio); image tags float on minor
+  versions.  [EVIDENCE] docker-compose.yml
+
+[OK] R24 Authentication checks
+  Admin routes need SYSTEM_ADMIN; anonymous routes are an explicit
+  allow-list; everything else needs a JWT. Per-service participant checks
+  not audited line by line (see section 12).
+  [EVIDENCE] .../common/security/SecurityConfig.java
+
+[OK] R25 Public recording access
+  No unrestricted public recording URLs: composite recordings and files use
+  15-minute presigned S3 URLs; speaking clips use 10-minute HMAC-signed URLs
+  issued after an access check and audited. Physical paths are never
+  returned by the API.
+  [EVIDENCE] application.yml (presign-ttl, access-url-ttl),
+             .../recording/service/SpeechRecordingService.java
+
+
+================================================================================
+11. DEPLOYMENT PREREQUISITES
+================================================================================
+[ ] Linux server with Docker Engine + Compose v2, enough CPU/RAM (Egress
+    alone wants 4 vCPU / 4 GB), and a data disk for DATA_ROOT.
+[ ] Public static IP set as LIVEKIT_NODE_IP (or LiveKit use_external_ip).
+[ ] DNS names for the app and media server (and TURN), with TLS certificates.
+[ ] TLS reverse proxy in front of web (3000), LiveKit (7880) and the S3 public
+    endpoint (9000), with WebSocket support.
+[ ] Firewall: 80, 443, 7881/tcp, 50000-50100/udp open; everything else closed
+    or bound to 127.0.0.1.
+[ ] Production .env: new secrets, DATA_ROOT=/srv/meetly, https/wss URLs,
+    APP_COOKIE_SECURE=true, APP_OPENAPI_ENABLED=false, real SMTP,
+    SPRING_PROFILES_ACTIVE=prod passed to the backend (compose change needed).
+[ ] Real SMTP account (verification and reset e-mails).
+[ ] ${DATA_ROOT}/Recordings created and writable by the container user.
+[ ] Off-host backups for DB dumps, MinIO data and speaking clips; tested
+    restore.
+[ ] Optional: Google/Microsoft OAuth apps (redirect
+    <public-url>/login/oauth2/code/{google|microsoft}), calendar apps
+    (redirect <callback-base>/api/v1/calendar/oauth/callback), TURN,
+    observability profile.
+[ ] Decision on open QA findings (RC-3, RC-6, RC-7, RC-13 matter most).
+
+
+================================================================================
+12. UNKNOWN / UNVERIFIED ITEMS
+================================================================================
+[UNKNOWN] Minimum Docker Engine and Docker Compose versions - not stated in
+          the project; Docker is not installed on the development PC.
+[UNKNOWN] Whether the Temurin Alpine image handles non-ASCII folder names
+          (speaking clips) correctly - depends on the container locale.
+[UNKNOWN] Composite recording (Egress -> MinIO) end to end - never succeeded
+          on the development PC.
+[UNKNOWN] Exact transitive library versions from the Spring Boot 4.0.9 BOM
+          (only PostgreSQL JDBC 42.7.14 seen in the local Maven cache).
+[UNKNOWN] Per-endpoint authorization inside services for every anonymous
+          route (the security allow-list was reviewed, service-level
+          participant-token checks were not audited line by line).
+[UNKNOWN] Purpose and coverage of qa/*.mjs scripts (names suggest functional,
+          load, resilience, security, concurrency checks; contents not
+          reviewed).
+[UNKNOWN] Grafana dashboards - only a datasource is provisioned
+          (infra/grafana/provisioning/datasources/datasources.yml); no
+          dashboard files found.
+[UNKNOWN] Behaviour on Linux of any part of the stack - nothing has been run
+          on Linux.
+
+================================================================================
+END OF REPORT
+================================================================================

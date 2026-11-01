@@ -1,0 +1,215 @@
+spring:
+  application:
+    name: meet-platform
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/meet}
+    username: ${DB_USERNAME:meet}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 2
+      connection-timeout: 5000
+      max-lifetime: 1800000
+      data-source-properties:
+        # Keep personal data out of logs and exception messages: without this, pgjdbc echoes the server's
+        # "Detail: Key (...)=(...)" and, for batched statements, the INSERT with all bound values (e.g. invitee
+        # name/e-mail) whenever a statement fails. The SQLSTATE and constraint name are still reported.
+        logServerErrorDetail: false
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+      connect-timeout: 2s
+  mail:
+    host: ${SMTP_HOST:localhost}
+    port: ${SMTP_PORT:1025}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: ${SMTP_AUTH:false}
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS:false}
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 10000
+      mail.smtp.writetimeout: 10000
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 26MB
+  mvc:
+    problemdetails:
+      enabled: true
+  web:
+    error:
+      include-message: never
+      include-stacktrace: never
+  # Social login: set the provider variables (see .env.example) and activate the "oauth" profile, which adds
+  # spring.security.oauth2.client.registration.{google,microsoft}. Without it, OAuth2 login is disabled.
+
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+  forward-headers-strategy: native
+  tomcat:
+    threads:
+      max: 200
+    connection-timeout: 10s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db,redis
+  metrics:
+    tags:
+      application: meet-platform
+  # Metrics are scraped by Prometheus; OTLP is used for traces only.
+  otlp:
+    metrics:
+      export:
+        enabled: false
+  tracing:
+    sampling:
+      probability: ${OTEL_SAMPLING_PROBABILITY:0.1}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+
+springdoc:
+  api-docs:
+    enabled: ${APP_OPENAPI_ENABLED:false}
+  swagger-ui:
+    enabled: ${APP_OPENAPI_ENABLED:false}
+    # keep the access token across page reloads while exploring the API
+    persist-authorization: true
+    tags-sorter: alpha
+    operations-sorter: method
+    try-it-out-enabled: true
+    display-request-duration: true
+
+logging:
+  level:
+    root: INFO
+    org.hibernate.SQL: WARN
+
+app:
+  public-url: ${APP_PUBLIC_URL:http://localhost:5173}
+  cors:
+    allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:http://localhost:5173}
+  security:
+    jwt-secret: ${APP_JWT_SECRET}
+    access-token-ttl: 15m
+    refresh-token-ttl: 30d
+    cookie-secure: ${APP_COOKIE_SECURE:true}
+    issuer: ${APP_JWT_ISSUER:meet-platform}
+    # /actuator/prometheus requires HTTP Basic "prometheus:<this password>"; empty = the endpoint is closed.
+    metrics-scrape-password: ${APP_METRICS_SCRAPE_PASSWORD:}
+  auth:
+    require-email-verification: ${APP_REQUIRE_EMAIL_VERIFICATION:true}
+    email-verification-ttl: 48h
+    password-reset-ttl: 1h
+    max-failed-logins: 10
+    lockout-duration: 15m
+  livekit:
+    public-url: ${LIVEKIT_PUBLIC_URL:ws://localhost:7880}
+    api-url: ${LIVEKIT_API_URL:http://localhost:7880}
+    api-key: ${LIVEKIT_API_KEY}
+    api-secret: ${LIVEKIT_API_SECRET}
+    token-ttl: 10m
+    empty-room-timeout-seconds: 300
+    request-timeout: 10s
+  storage:
+    endpoint: ${S3_ENDPOINT:http://localhost:9000}
+    public-endpoint: ${S3_PUBLIC_ENDPOINT:http://localhost:9000}
+    access-key: ${S3_ACCESS_KEY}
+    secret-key: ${S3_SECRET_KEY}
+    region: ${S3_REGION:us-east-1}
+    recordings-bucket: ${S3_RECORDINGS_BUCKET:meet-recordings}
+    files-bucket: ${S3_FILES_BUCKET:meet-files}
+    presign-ttl: 15m
+    # s3 = S3/MinIO (uat, prod); local = files on this machine's disk under local-root (dev profile)
+    type: ${APP_STORAGE_TYPE:s3}
+    local-root: ${APP_STORAGE_LOCAL_ROOT:}
+  recording:
+    default-retention-days: ${APP_RECORDING_RETENTION_DAYS:90}
+    file-prefix: recordings
+  # Speaking clips: one .webm per participant per speaking turn, recorded by the participant's browser and filed under
+  # <storage-path>/DD-MM-YYYY/<Meeting_Title>/<Participant_Name>/DDMMYYHHmmss_<id>.webm (README-Docker.md, docs).
+  speech-recordings:
+    storage-path: ${RECORDING_STORAGE_PATH:./data/Recordings}
+    # New clips and chunks are refused (507) when less than this is free on that disk.
+    min-free-bytes: ${RECORDING_MIN_FREE_BYTES:209715200}
+    max-chunk-bytes: 8388608
+    max-clip-bytes: 524288000
+    access-url-ttl: PT10M
+    # A clip with no chunk for this long is closed as INCOMPLETE (browser gone, or a restart while recording).
+    stale-after: PT2M
+    recovery-interval: PT1M
+  rate-limit:
+    enabled: ${APP_RATE_LIMIT_ENABLED:true}
+  # Shared state between API instances: per-room signal numbers and scheduled-job locks.
+  # redis (default; several instances) or memory (a single instance without Redis).
+  coordination:
+    store: ${APP_COORDINATION_STORE:redis}
+  notifications:
+    dispatch-enabled: ${APP_NOTIFICATIONS_DISPATCH_ENABLED:true}
+    from-address: ${APP_MAIL_FROM:no-reply@meet.local}
+    max-attempts: 5
+    reminder-offsets: 24h,1h
+  files:
+    max-size-bytes: 26214400
+    allowed-content-types: >-
+      application/pdf,image/png,image/jpeg,image/gif,image/webp,text/plain,text/csv,
+      application/vnd.openxmlformats-officedocument.wordprocessingml.document,
+      application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,
+      application/vnd.openxmlformats-officedocument.presentationml.presentation,
+      application/zip
+  calendar:
+    # 32 random bytes, Base64 (openssl rand -base64 32). Required to store calendar OAuth tokens.
+    encryption-key: ${APP_CALENDAR_ENCRYPTION_KEY:}
+    # Public base URL that reaches this API (used for the OAuth redirect URI); defaults to app.public-url.
+    callback-base-url: ${APP_CALENDAR_CALLBACK_BASE_URL:}
+    google:
+      client-id: ${GOOGLE_CALENDAR_CLIENT_ID:}
+      client-secret: ${GOOGLE_CALENDAR_CLIENT_SECRET:}
+    microsoft:
+      client-id: ${MICROSOFT_CALENDAR_CLIENT_ID:}
+      client-secret: ${MICROSOFT_CALENDAR_CLIENT_SECRET:}
+      tenant: ${MICROSOFT_CALENDAR_TENANT:common}
+  meetings:
+    default-max-participants: 100
+    hard-max-participants: 300
+    # A host whose connection drops gets a successor only if they have not reconnected within this time.
+    host-dropout-grace: ${APP_HOST_DROPOUT_GRACE:PT20S}
+    # Joins and leaves within this window are announced as one participant-count update (large rooms).
+    presence-debounce: ${APP_PRESENCE_DEBOUNCE:PT0.25S}
+    # A participant whose connection closed may take its seat back within this time (reload, second tab, role-change
+    # reconnect) even if the room was locked or filled meanwhile.
+    reconnect-window: ${APP_RECONNECT_WINDOW:PT30S}

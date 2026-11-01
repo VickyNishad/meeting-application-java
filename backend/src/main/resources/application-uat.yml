@@ -1,0 +1,10 @@
+# UAT / staging. Activate with SPRING_PROFILES_ACTIVE=uat. Production-like: S3 object storage, secure cookies;
+# API docs may be switched on for testers with APP_OPENAPI_ENABLED=true.
+app:
+  storage:
+    type: s3
+
+management:
+  tracing:
+    sampling:
+      probability: ${OTEL_SAMPLING_PROBABILITY:1.0}
