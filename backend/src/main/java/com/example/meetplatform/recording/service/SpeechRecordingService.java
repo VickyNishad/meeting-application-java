@@ -5,6 +5,7 @@ import com.example.meetplatform.common.audit.AuditService;
 import com.example.meetplatform.common.config.AppProperties;
 import com.example.meetplatform.common.exception.ApiException;
 import com.example.meetplatform.common.exception.ErrorCode;
+import com.example.meetplatform.common.persistence.AfterCommit;
 import com.example.meetplatform.common.response.PageParams;
 import com.example.meetplatform.common.response.PageResponse;
 import com.example.meetplatform.common.security.CurrentUser;
@@ -17,6 +18,7 @@ import com.example.meetplatform.recording.dto.SpeechRecordingDtos.AccessUrl;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Facets;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.FinishRequest;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Option;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.ParticipantOption;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.SpeechRecordingView;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.StartRequest;
 import com.example.meetplatform.recording.entity.SpeechRecording;
@@ -38,6 +40,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -88,6 +91,7 @@ public class SpeechRecordingService {
     private final ParticipantAccessService participantAccess;
     private final RoomSessionService roomSessions;
     private final SpeechClipStorage storage;
+    private final SpeechClipObjectStore objectStore;
     private final RateLimiter rateLimiter;
     private final AuditService audit;
     private final TransactionTemplate tx;
@@ -100,7 +104,8 @@ public class SpeechRecordingService {
 
     public SpeechRecordingService(SpeechRecordingRepository recordings, MeetingRepository meetings,
                                   ParticipantAccessService participantAccess, RoomSessionService roomSessions,
-                                  SpeechClipStorage storage, RateLimiter rateLimiter, AuditService audit,
+                                  SpeechClipStorage storage, SpeechClipObjectStore objectStore,
+                                  RateLimiter rateLimiter, AuditService audit,
                                   TransactionTemplate tx, AppProperties properties, Clock clock,
                                   @Value("${app.speech-recordings.max-chunk-bytes:8388608}") long maxChunkBytes,
                                   @Value("${app.speech-recordings.max-clip-bytes:524288000}") long maxClipBytes,
@@ -110,6 +115,7 @@ public class SpeechRecordingService {
         this.participantAccess = participantAccess;
         this.roomSessions = roomSessions;
         this.storage = storage;
+        this.objectStore = objectStore;
         this.rateLimiter = rateLimiter;
         this.audit = audit;
         this.tx = tx;
@@ -215,6 +221,7 @@ public class SpeechRecordingService {
         }
         try {
             long size = storage.finish(clip.getStoragePath());
+            publish(clip);
             clip.complete(size, now, Math.max(0, now.toEpochMilli() - clip.getStartTime().toEpochMilli()));
         } catch (ApiException e) {
             if (e.code() != ErrorCode.CONFLICT) {
@@ -265,10 +272,32 @@ public class SpeechRecordingService {
         }
         Instant end = clip.getLastChunkAt() != null ? clip.getLastChunkAt() : clock.instant();
         if (size > 0) {
+            publish(clip);
             clip.incomplete(size, end, reason);
         } else {
             clip.fail(end, "No valid media was received. " + reason);
         }
+    }
+
+    /**
+     * With S3 storage: uploads the finalized local clip before its status changes, so a clip is never COMPLETED or
+     * INCOMPLETE without its object. An upload failure throws STORAGE_UNAVAILABLE and leaves the clip RECORDING with
+     * its local file (finish can be retried; the recovery job retries it). The staged copy is removed only once the
+     * new status is committed. With local storage: nothing to do, the finalized file is the result.
+     */
+    private void publish(SpeechRecording clip) {
+        if (!objectStore.enabled()) {
+            return;
+        }
+        Path file = storage.readable(clip.getStoragePath());
+        objectStore.upload(clip.getStoragePath(), file, clip.getFileFormat());
+        AfterCommit.run(() -> {
+            try {
+                Files.deleteIfExists(file);
+            } catch (IOException e) {
+                log.warn("Uploaded speaking clip {} could not be removed from staging: {}", clip.getId(), e.getMessage());
+            }
+        });
     }
 
     private SpeechRecording ownClipForUpdate(UUID meetingId, UUID recordingId, MeetingParticipant participant) {
@@ -310,7 +339,11 @@ public class SpeechRecordingService {
         boolean hosted = isHosted(view);
         UUID id = user.userId();
         List<Option> meetingOptions = options(hosted ? recordings.hostedMeetings(id) : recordings.ownMeetings(id));
-        List<Option> participantOptions = options(hosted ? recordings.hostedParticipants(id) : recordings.ownParticipants(id));
+        List<ParticipantOption> participantOptions = (hosted ? recordings.hostedParticipants(id) : recordings.ownParticipants(id))
+                .stream()
+                .map(r -> new ParticipantOption((UUID) r[0], (String) r[1], (UUID) r[2]))
+                .sorted(Comparator.comparing(ParticipantOption::label, String.CASE_INSENSITIVE_ORDER))
+                .toList();
         List<String> dates = (hosted ? recordings.hostedDates(id) : recordings.ownDates(id)).stream()
                 .map(d -> LocalDate.parse(d, FOLDER_DATE))
                 .sorted(Comparator.reverseOrder())
@@ -352,10 +385,20 @@ public class SpeechRecordingService {
             throw ApiException.forbidden("This link has expired.");
         }
         SpeechRecording clip = recordings.findById(recordingId).orElseThrow(() -> ApiException.notFound("Recording"));
-        return new ClipFile(storage.readable(clip.getStoragePath()), clip.getFileName(), clip.getFileFormat(), download);
+        if (objectStore.enabled()) {
+            // The bucket is private: the browser is sent on to a presigned URL valid no longer than this link.
+            Duration ttl = Duration.ofSeconds(Math.max(1, Math.min(accessTtl.toSeconds(),
+                    expires - clock.instant().getEpochSecond())));
+            String url = objectStore.presignGet(clip.getStoragePath(), clip.getFileName(), clip.getFileFormat(),
+                    download, ttl);
+            return new ClipFile(null, clip.getFileName(), clip.getFileFormat(), download, url);
+        }
+        return new ClipFile(storage.readable(clip.getStoragePath()), clip.getFileName(), clip.getFileFormat(), download,
+                null);
     }
 
-    public record ClipFile(Path path, String fileName, String contentType, boolean download) {
+    /** Either a local {@code path} to stream or, with S3 storage, a presigned {@code redirectUrl}. */
+    public record ClipFile(Path path, String fileName, String contentType, boolean download, String redirectUrl) {
     }
 
     /** The clip, if this user may see it (its meeting's host, or the participant it belongs to); 404 otherwise. */

@@ -41,7 +41,11 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
     @Query("select distinct r.meetingId, r.meetingTitle from SpeechRecording r where r.hostId = :user")
     List<Object[]> hostedMeetings(UUID user);
 
-    @Query("select distinct r.participantId, r.participantName from SpeechRecording r where r.hostId = :user")
+    /**
+     * Participants with clips, each with the meeting it belongs to: participantId is a meeting_participants row,
+     * i.e. one person's participation in one meeting. Lets the participant filter follow the meeting filter.
+     */
+    @Query("select distinct r.participantId, r.participantName, r.meetingId from SpeechRecording r where r.hostId = :user")
     List<Object[]> hostedParticipants(UUID user);
 
     /** The folder date (DD-MM-YYYY, the first segment of the storage path). */
@@ -51,7 +55,8 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
     @Query("select distinct r.meetingId, r.meetingTitle from SpeechRecording r where r.participantUserId = :user")
     List<Object[]> ownMeetings(UUID user);
 
-    @Query("select distinct r.participantId, r.participantName from SpeechRecording r where r.participantUserId = :user")
+    @Query("select distinct r.participantId, r.participantName, r.meetingId from SpeechRecording r "
+            + "where r.participantUserId = :user")
     List<Object[]> ownParticipants(UUID user);
 
     @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.participantUserId = :user")

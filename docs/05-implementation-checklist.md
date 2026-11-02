@@ -2,10 +2,11 @@
 
 Status legend: ✅ implemented and covered by automated tests · 🟢 implemented, compiles/builds, not yet exercised
 against real infrastructure · 🟡 partial · ⬜ not started. "Real infrastructure" means a running LiveKit SFU,
-Egress, S3 storage, SMTP and two real browsers. None was available on the build machine (no Docker).
+Egress, S3 storage, SMTP and two real browsers.
 
-Last verified: 2026-10-27. Backend: `./mvnw test` → 23 tests, 0 failures (real PostgreSQL 14 embedded; CI uses
-PostgreSQL 17 via Testcontainers). Web: typecheck, lint, 49 unit tests, production build, Playwright smoke (6 passed, 2 skipped: need a running backend).
+Last verified: 2026-11-02. Backend: `./mvnw verify` → 163 tests in 33 classes, 0 failures, 1 skipped (real
+PostgreSQL; CI uses PostgreSQL 17 via Testcontainers). Web (in the `node:24` build image): typecheck, lint,
+186 unit tests in 28 files, production build. Playwright suites not re-run on this date.
 
 ## Phase 1 — Analysis and design
 | Item | Status |
@@ -66,7 +67,8 @@ PostgreSQL 17 via Testcontainers). Web: typecheck, lint, 49 unit tests, producti
 |---|---|
 | Admin: stats, users enable/disable/role, live meetings, audit search | ✅ (access control) · 🟢 |
 | Metrics (Micrometer/Prometheus), tracing (OpenTelemetry → Jaeger), alert rules | 🟢 |
-| Docker images, Compose stack (Postgres, Redis, S3, Mailpit, LiveKit, Egress, API, web, observability) | 🟢 not run: Docker unavailable on build machine |
+| Docker images, Compose stack (Postgres, Redis, S3, Mailpit, LiveKit, Egress, API, web, observability) | 🟢 run locally on Docker Desktop; `docker compose config` valid for all profiles |
+| Production hardening of the Compose stack: `prod` profile by default, API/MinIO on loopback, LiveKit UDP range matches published ports, embedded TURN (opt-in), Caddy HTTPS (`--profile tls`), CSP on the SPA, `/actuator/*` except health blocked at nginx | 🟢 configs validated (nginx -t, caddy validate, LiveKit boots with TURN); not yet run on a public server |
 | Load test kit (k6 control plane, `lk load-test` media plane) | 🟢 scripts only — **capacity target not yet measured** |
 | Production deployment guide, backup/restore, firewall/TURN | ✅ docs |
 

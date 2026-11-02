@@ -509,7 +509,8 @@ export interface SpeechRecording {
 
 export interface SpeechRecordingFacets {
   meetings: { id: string; label: string }[];
-  participants: { id: string; label: string }[];
+  /** Participants with clips; each is one participation, in the meeting `meetingId`. */
+  participants: { id: string; label: string; meetingId: string }[];
   /** Folder dates, YYYY-MM-DD, newest first. */
   dates: string[];
 }

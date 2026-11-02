@@ -33,6 +33,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.util.UUID;
@@ -107,13 +108,22 @@ public class SpeechRecordingController {
         return service.accessUrl(recordingId, download, currentUser.require());
     }
 
-    /** The file, through a signed URL from {@link #accessUrl}. Range requests work (seeking in the player). */
+    /**
+     * The file, through a signed URL from {@link #accessUrl}. Range requests work (seeking in the player). With S3
+     * storage the same link redirects to a short-lived presigned URL of the private bucket.
+     */
     @Hidden
     @GetMapping(SpeechRecordingService.CONTENT_PATH)
     public ResponseEntity<Resource> content(@PathVariable UUID id, @RequestParam long expires,
                                             @RequestParam(defaultValue = "false") boolean download,
                                             @RequestParam String sig) {
         SpeechRecordingService.ClipFile file = service.content(id, expires, download, sig);
+        if (file.redirectUrl() != null) {
+            return ResponseEntity.status(HttpStatus.FOUND)
+                    .location(URI.create(file.redirectUrl()))
+                    .cacheControl(CacheControl.noStore().cachePrivate())
+                    .build();
+        }
         ContentDisposition disposition = (file.download() ? ContentDisposition.attachment() : ContentDisposition.inline())
                 .filename(file.fileName(), StandardCharsets.UTF_8).build();
         return ResponseEntity.ok()

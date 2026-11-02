@@ -1,0 +1,215 @@
+================================================================================
+RECORDING FILTER FIX - MEETING-WISE PARTICIPANT FILTERING
+================================================================================
+Date    : 2026-11-02
+Page    : Recordings -> "Speaking clips" (web/src/pages/recordings/SpeakingClips.tsx)
+Status  : Implemented as approved, tested, independent QA done.
+          QA findings (section 8) are reported only. None were fixed (awaiting approval).
+Scope   : Targeted fix. Participant options stay clip-based (approved): only
+          participants with speaking clips in the selected meeting are offered;
+          people who joined but never produced a clip are not shown.
+
+
+--------------------------------------------------------------------------------
+1. ROOT CAUSE
+--------------------------------------------------------------------------------
+Only the dropdown options were wrong. The clip list was already filtered correctly
+(GET /api/v1/speech-recordings applies meetingId AND participantId).
+
+a) Backend dropped the relationship. GET /api/v1/speech-recordings/facets built
+   the participant options with
+     select distinct r.participantId, r.participantName ... where hostId/participantUserId = :user
+   so no option said which meeting it belonged to.
+b) The frontend never linked the two dropdowns. SpeakingClips.tsx loaded facets
+   once per view and always rendered facets.participants in full, whatever
+   meeting was selected.
+c) No reset on meeting change. The meeting dropdown used the generic filter()
+   handler, so a participant chosen for meeting A was still sent with meeting B
+   (meetingId=B&participantId=<A's participation>), which silently gave an
+   empty list.
+(Also: a failed facets request was silently ignored; the dropdowns showed only
+"All ...".)
+
+
+--------------------------------------------------------------------------------
+2. DATABASE RELATIONSHIP USED (no schema change)
+--------------------------------------------------------------------------------
+  speech_recordings.participant_id  ->  meeting_participants.id
+  meeting_participants.meeting_id   ->  meetings.id     (NOT NULL)
+  speech_recordings.meeting_id      ->  meetings.id     (stored on every clip)
+
+A meeting_participants row is one person's participation in exactly ONE
+meeting. The same person in two meetings has two rows and two participant ids.
+Each clip's (participant_id, meeting_id) pair is therefore the real
+participation relationship. Participant options come from speech_recordings
+(clip-based, as approved) and carry that meeting_id. Users are never listed
+as participants.
+
+
+--------------------------------------------------------------------------------
+3. FILES CHANGED
+--------------------------------------------------------------------------------
+Backend (backend/src/main/java/com/example/meetplatform/recording/)
+  MOD  repository/SpeechRecordingRepository.java
+         hostedParticipants / ownParticipants also select r.meetingId.
+  MOD  dto/SpeechRecordingDtos.java
+         + record ParticipantOption(UUID id, String label, UUID meetingId);
+         Facets.participants is now List<ParticipantOption>.
+  MOD  service/SpeechRecordingService.java
+         facets(): maps the participant rows to ParticipantOption (same sort, same
+         access rules).
+Frontend (web/src/)
+  MOD  lib/api/types.ts                      participants: { id, label, meetingId }[]
+  MOD  pages/recordings/SpeakingClips.tsx    dependent participant options, reset
+                                             on meeting change, loading/empty/error
+Tests
+  NEW  web/src/pages/recordings/SpeakingClips.test.tsx                         (10 tests)
+  NEW  backend/src/test/java/com/example/meetplatform/recording/
+         SpeechRecordingFacetsIntegrationTest.java                             (3 tests)
+
+Not changed: recording lifecycle, storage (LOCAL/S3), the list endpoint and its
+query, the date filter, the view switch, pagination, playback and download,
+cloud recordings, database schema/migrations, other pages. No existing test was
+modified, deleted or disabled.
+
+
+--------------------------------------------------------------------------------
+4. BACKEND / API CHANGES
+--------------------------------------------------------------------------------
+GET /api/v1/speech-recordings/facets?view=hosted|mine   (existing endpoint, no new endpoint)
+  participants[] items gain one field:
+    before: { "id": "...", "label": "Vicky" }
+    after : { "id": "...", "label": "Vicky", "meetingId": "..." }
+  "meetings" and "dates" are unchanged. Backward compatible: a field was
+  added, nothing was removed or renamed.
+Authorization unchanged: hosted = clips of meetings the user hosts; mine = the
+user's own clips.
+
+
+--------------------------------------------------------------------------------
+5. FRONTEND CHANGES (SpeakingClips.tsx)
+--------------------------------------------------------------------------------
+- Participant options = all participants for "All meetings"; otherwise only those
+  with meetingId === the selected meeting (useMemo over data already loaded).
+  No extra API call, so the update is instant and there are no out-of-order
+  responses.
+- Meeting change (changeMeeting): clears the selected participant if it is not a
+  participation in the new meeting, and resets to page 0. Going back to "All
+  meetings" keeps it.
+- Loading: the participant select is disabled with "Loading participants…".
+- Empty: a meeting with no participant options shows a disabled "No
+  participants in this meeting".
+- Error: role="alert" message "The filter options could not be loaded: ..." with
+  a Retry button.
+- Date filter, view switch (resets everything), pagination, list, player and
+  download are unchanged.
+
+
+--------------------------------------------------------------------------------
+6. TEST CASES AND ACTUAL RESULTS (executed 2026-11-02)
+--------------------------------------------------------------------------------
+Frontend - SpeakingClips.test.tsx (Vitest, API mocked; Node 24 container)   10/10 PASSED
+  1  All meetings -> all participants (existing behaviour)                    PASS
+  2  Meeting A -> only A's participants; Meeting B -> only B's                PASS
+  3  A -> B: participant of A reset, list request has meetingId=B and no
+     participant; the same person's participation in A is not carried to B    PASS
+  4  Participant belonging to the new meeting is kept; back to All keeps it    PASS
+  5  Participant picked under All is reset when a meeting it is not in is
+     chosen                                                                    PASS
+  6  Meeting with no participant options -> empty, disabled state             PASS
+  7  Meeting changes trigger no extra facets requests (1 call total)          PASS
+  8  Loading -> participant select disabled ("Loading participants…")         PASS
+  9  Facets API failure -> alert + working Retry                              PASS
+  10 Regression: date + meeting + participant sent together; view switch
+     resets all filters                                                       PASS
+  Mutation checks (inside the container only; project files untouched):
+    restored old "show all participants" -> 3 of 10 tests FAIL (detected)
+    removed the reset on meeting change   -> 1 of 10 tests FAIL (detected)
+    Note: when a <select> value is not among its options, it reads back as "",
+    so the reset is proven through the list request (test 3), not the DOM.
+
+Backend - SpeechRecordingFacetsIntegrationTest (real PostgreSQL 17)          3/3 PASSED
+  - Two meetings, the same name "Vicky" in both, Rahul only in A, Asha only
+    in B: each option has the right meetingId. "Silent Sam" (joined, no clip)
+    is NOT offered. meetings/dates keep their shape.
+  - Meeting + participant -> only that participant's clips in that meeting (2);
+    a participant of another meeting -> 0; meeting only -> 3; participant only -> 1.
+  - "mine" view: each of the user's own participations has its meetingId.
+
+Regression (full suites)
+  Backend  ./mvnw -B verify : Tests run 180, Failures 0, Errors 0, Skipped 1
+           BUILD SUCCESS (177 before + 3 new; the skipped test is
+           LiveKitMediaAdapterLiveTest, which needs a live LiveKit server and
+           was skipped before too). The existing SpeechRecordingIntegrationTest
+           passes 6/6.
+  Web      typecheck OK, lint OK, 29 files / 199 tests passed (189 before + 10 new),
+           production build OK.
+
+Not run: manual click-through in a browser against the Docker stack (the
+local database has no speaking clips yet; covered by the component and
+integration tests above).
+
+
+--------------------------------------------------------------------------------
+7. API / DATABASE IMPACT
+--------------------------------------------------------------------------------
+No new endpoint, no new table, no migration. One field added to an existing
+response. The query is the same per-user DISTINCT over speech_recordings with
+one more column (participant_id already determines meeting_id, so the row count
+is unchanged).
+
+
+--------------------------------------------------------------------------------
+8. INDEPENDENT QA FINDINGS (separate QA agent; NOT fixed - awaiting approval)
+--------------------------------------------------------------------------------
+Verdict: the QA agent could not break the fix. No HIGH or MEDIUM findings, and
+no regression in scope. It re-ran: image build (tsc + vite build), ESLint, the
+recordings tests (12/12), the full web suite (199/199) and the targeted backend
+tests (Facets 3/3, SpeechRecordingIntegration 6/6).
+
+CONFIRMED
+QA-1 LOW (new code). If a background facets refetch fails after the options
+     have loaded (TanStack Query keeps the data and sets isError), the alert says
+     "The filter options could not be loaded" while the options are still shown
+     and usable. Reproduced by the agent. Possible fix: show the alert only when
+     there is no data (isError && !data), or soften the wording.
+QA-2 LOW / latent. The reset runs only on meeting change. If a refetch ever
+     dropped the selected participant, the select would read "All participants"
+     while the request still sent that participantId. The agent found no path
+     that triggers this today (clips are never deleted, so facets only grow).
+QA-3 INFO, existed before the fix (out of scope). A meeting renamed while it is
+     live shows twice in the meeting list (each clip keeps the title it was
+     recorded under), and React logs a duplicate-key warning. Participant
+     filtering under either entry is still correct.
+QA-4 INFO, existed before the fix (out of scope). Under "All meetings", the same
+     name in two meetings appears twice ("Vicky", "Vicky"); they are different
+     participations and behave correctly. Showing the meeting title in the label
+     would be an optional UX change.
+QA-5 INFO. If facets fail on first load, the selects stay enabled with only
+     "All ..."; the alert with Retry is shown. Acceptable.
+
+SUSPECTED (reasoned, not reproduced), existed before / out of scope
+QA-6 INFO. Meeting and participant options ignore the date filter; a
+     combination with no clips on that date gives an empty list (never wrong
+     results).
+QA-7 INFO. Options include participants whose clips are RECORDING/FAILED,
+     consistent with the list, which shows those clips with a status badge.
+
+Held up under QA: all the meeting-switch scenarios, refetch adding a
+participant, page reset on meeting change, view switch with filters set
+(loading state, cleared filters, cached view), no extra requests, accessibility
+(labels, disabled state, role=alert + Retry), backend authorization (same rule
+as the list; no leak path found; "mine" scoped to the user), NOT NULL columns
+(no null meetingId, safe sort), backward-compatible response.
+QA note: no test checks that an unrelated user gets empty facets (the query
+makes a leak impossible; it would only guard against regressions).
+
+
+--------------------------------------------------------------------------------
+9. REMAINING ISSUES
+--------------------------------------------------------------------------------
+- QA-1 and QA-2 (LOW) are open, awaiting your decision. QA-3 to QA-7 are out of
+  scope or informational.
+- No manual browser check against real clip data yet.
+- Nothing committed to git. This fix and earlier work are in the working tree.
+================================================================================

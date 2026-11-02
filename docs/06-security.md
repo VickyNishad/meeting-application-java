@@ -26,8 +26,10 @@
 
 ## Operational checklist before go-live
 - [ ] Rotate every secret in `.env`; store them in a secret manager (Vault / cloud KMS / Kubernetes secrets).
-- [ ] `APP_COOKIE_SECURE=true`, `APP_OPENAPI_ENABLED=false`, `APP_REQUIRE_EMAIL_VERIFICATION=true`.
-- [ ] Set `APP_METRICS_SCRAPE_PASSWORD` (Prometheus scrapes with HTTP Basic `prometheus:<password>`), and still block `/actuator/prometheus` at the public proxy.
+- [ ] `SPRING_PROFILES_ACTIVE=prod` (forces `APP_COOKIE_SECURE=true`, `APP_OPENAPI_ENABLED=false`, `APP_REQUIRE_EMAIL_VERIFICATION=true`).
+- [ ] Set `APP_METRICS_SCRAPE_PASSWORD` (Prometheus scrapes with HTTP Basic `prometheus:<password>`). The web nginx serves only `/actuator/health*` and returns 404 for every other `/actuator/` path.
+- [ ] The API (8080) and MinIO (9000/9001) are not published beyond loopback; all browser traffic enters through nginx/Caddy.
+- [ ] Never commit runtime data: `docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings` are git-ignored (a database dump holds user e-mails and password hashes).
 - [ ] Restrict LiveKit's HTTP API (7880) to the API servers, except the WebSocket signalling path for clients.
 - [ ] Enable encryption at rest for PostgreSQL volumes and the object store; bucket policies private.
 - [ ] Recording consent wording reviewed by legal for each jurisdiction served, including the automatic-recording notice on the join page ("By joining you agree to be recorded").

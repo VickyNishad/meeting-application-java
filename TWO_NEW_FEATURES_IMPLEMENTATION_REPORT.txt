@@ -1,0 +1,323 @@
+================================================================================
+TWO NEW FEATURES - IMPLEMENTATION REPORT
+  Feature 1: environment-based recording storage (LOCAL Windows D: / AWS S3)
+  Feature 2: active speaker green border
+================================================================================
+Date        : 2026-11-02
+Status      : IMPLEMENTED, TESTED, QA FIXES APPLIED AND RE-VERIFIED.
+              Independent QA found 7 issues (section 7). With approval, QA-1, QA-2,
+              QA-4 and QA-7 were fixed in code and QA-3 in the docs; QA-5 and
+              QA-6 were accepted as documented. Final verification: section 6.
+Scope       : As planned and approved. Answers to the two open questions were not
+              given, so the stated defaults were used:
+                - Feature 1 applies to SPEAKING CLIPS (the recordings that use the
+                  DD-MM-YYYY/<Meeting>/<Participant>/DDMMYYHHmmss_<id>.webm
+                  layout). Cloud recordings made by LiveKit Egress are unchanged.
+                - Local folder: D:\MeetingApplication\Recordings
+
+
+--------------------------------------------------------------------------------
+1. FILES CHANGED
+--------------------------------------------------------------------------------
+Feature 1 - backend (paths under backend/src/main/java/com/example/meetplatform/)
+  NEW  recording/service/SpeechClipObjectStore.java
+         Selects LOCAL or S3 from RECORDING_STORAGE_TYPE. S3 support: upload a
+         finished clip, presigned GET, startup bucket check. Never creates the
+         bucket and never makes it public. Uses the MinIO SDK that the project
+         already depends on (no new dependency).
+  MOD  recording/service/SpeechRecordingService.java
+         + publish(clip): with S3 only, uploads the verified file BEFORE the clip
+           is marked COMPLETED (finish) or INCOMPLETE (recovery). The staged
+           copy is deleted only after the database commit.
+         + content(): with S3 only, returns a presigned redirect URL instead of
+           a local file path.
+         ClipFile record gained a redirectUrl field (internal type only).
+  MOD  recording/controller/SpeechRecordingController.java
+         content(): with S3, answers 302 to the presigned URL. LOCAL streaming is
+         unchanged.
+  MOD  backend/src/main/resources/application.yml       (storage-type, RECORDING_LOCAL_PATH, s3.*)
+  MOD  backend/src/main/resources/application-dev.yml   (default D:/MeetingApplication/Recordings)
+  MOD  backend/src/main/resources/application-prod.yml  (storage-type defaults to S3)
+
+Feature 1 - deployment
+  MOD  docker-compose.yml   backend: RECORDING_STORAGE_TYPE and AWS_* settings;
+                            recordings bind source = RECORDING_LOCAL_PATH
+  MOD  .env.example         new "Speaking-clip storage" section
+  MOD  .env (local only, git-ignored; secrets untouched)
+                            appended RECORDING_STORAGE_TYPE=LOCAL and
+                            RECORDING_LOCAL_PATH=D:/MeetingApplication/Recordings
+
+Feature 2 - web
+  MOD  web/src/pages/room/speaking.ts      SPEAKING_RELEASE_MS now comes from
+                                           VITE_SPEAKING_RELEASE_MS (default 600)
+  MOD  web/src/vite-env.d.ts               type for the new variable
+  MOD  web/.env.example, web/Dockerfile, docker-compose.yml (web build arg)
+
+Tests (new; no existing test was changed, deleted or disabled)
+  NEW  backend/src/test/.../recording/SpeechClipFlow.java  (shared HTTP flow helper)
+  NEW  backend/src/test/.../recording/SpeechClipObjectStoreTest.java                (5 tests)
+  NEW  backend/src/test/.../recording/service/SpeechClipCredentialsTest.java        (2 tests, QA-1)
+  NEW  backend/src/test/.../recording/SpeechRecordingLocalStorageIntegrationTest.java (2 tests)
+  NEW  backend/src/test/.../recording/SpeechRecordingS3StorageIntegrationTest.java    (5 tests, incl. QA-7)
+
+QA fixes (after approval)
+  MOD  recording/service/SpeechClipObjectStore.java
+         QA-1: IAM role provider used on its own when no keys are set.
+         QA-2: S3 client timeouts of 10 s connect and 2 min read/write.
+         QA-4: an empty RECORDING_STORAGE_TYPE means S3 with the prod profile,
+               LOCAL otherwise.
+  MOD  application.yml, docker-compose.yml  (QA-4: the value passes through empty when unset)
+  MOD  .env.example, docs/07-deployment.md  (QA-3: storage section, S3 setup, LOCAL->S3 migration)
+  MOD  web/src/pages/room/speaking.test.tsx   (+3 tests appended; existing tests unchanged)
+
+NOT changed (verified with git status): SpeechClipStorage (write, append,
+verify, naming, folder layout), SpeechRecording entity, the database schema
+(no migration), RecordingService (cloud recording), useSpeechRecorder (clip
+start/stop triggers), RoomView and the participant grid, the LiveKit config,
+and every API URL and response body.
+
+
+--------------------------------------------------------------------------------
+2. FEATURES ADDED
+--------------------------------------------------------------------------------
+Feature 1 - environment-based storage for speaking clips
+  RECORDING_STORAGE_TYPE=LOCAL (default; the dev profile and local Docker)
+    Behaviour is identical to before. Clips are written to RECORDING_LOCAL_PATH
+    (falls back to the existing RECORDING_STORAGE_PATH):
+      D:\MeetingApplication\Recordings\DD-MM-YYYY\<Meeting>\<Participant>\DDMMYYHHmmss_<id>.webm
+  RECORDING_STORAGE_TYPE=S3 (production; the prod profile defaults to S3)
+    1. Chunks are written to the local folder exactly as before (it is now a
+       staging folder), then finalized and verified as WebM by the existing code.
+    2. The verified file is uploaded to s3://AWS_S3_BUCKET/[AWS_S3_PREFIX/]<same relative path>.
+    3. Only then is the clip marked COMPLETED (or INCOMPLETE by recovery).
+    4. The staged file is deleted after the database commit.
+    If the upload fails: the API returns 503, the clip stays RECORDING with its
+    verified local file, and either a retried finish or the existing
+    once-a-minute recovery job completes it once S3 is reachable again.
+    Playback and download keep the same API (access-url, then the signed
+    /content link). That link now redirects (302) to a presigned S3 URL that
+    lasts no longer than the signed link.
+
+Feature 2 - active speaker green border
+  Already implemented in the existing application (found during analysis):
+  LiveKit server-side voice activity detection, a 3px green frame per tile,
+  several speakers at once, an immediate off on mute or disconnect, a
+  stale-event guard after unmute, clearing on reconnect, per-tile re-renders,
+  and respect for the visibility modes. The only addition: the silence
+  threshold is configurable with VITE_SPEAKING_RELEASE_MS (0-10000 ms,
+  default 600). Recording is not affected: speaking clips pass their own
+  threshold (CLIP_RELEASE_MS) to the shared hook.
+
+
+--------------------------------------------------------------------------------
+3. EXISTING RECORDING FUNCTIONALITY PRESERVED
+--------------------------------------------------------------------------------
+- LOCAL is the default and takes exactly the old code path. The new code
+  returns immediately when S3 is not selected.
+- Recording triggers, the browser recorder, the chunk protocol, the
+  verification rules, the status rules, the folder hierarchy, file names,
+  database columns and metadata are all unchanged.
+- "COMPLETED only after the file is safely stored" is stricter in S3 mode
+  (the upload must succeed too), never looser.
+- Cloud recordings (Egress), the local browser recording, the dashboards and
+  the recording APIs are untouched.
+- Evidence: all 163 pre-existing backend tests and all 186 pre-existing web
+  tests still pass (section 6).
+
+
+--------------------------------------------------------------------------------
+4. STORAGE CONFIGURATION INSTRUCTIONS
+--------------------------------------------------------------------------------
+Local development (Windows)
+  Without Docker (start-local.ps1, dev profile): nothing to set. The default is
+    D:/MeetingApplication/Recordings. Override with RECORDING_LOCAL_PATH.
+  Docker Desktop: in .env
+    RECORDING_STORAGE_TYPE=LOCAL
+    RECORDING_LOCAL_PATH=D:/MeetingApplication/Recordings
+  The folder is created on first use.
+
+Production (Linux)
+  .env (Docker) or environment (java -jar with SPRING_PROFILES_ACTIVE=prod):
+    SPRING_PROFILES_ACTIVE=prod
+    RECORDING_STORAGE_TYPE=S3          # empty also means S3 with the prod profile (QA-4)
+    AWS_REGION=ap-south-1              # your region
+    AWS_S3_BUCKET=your-private-bucket
+    AWS_S3_PREFIX=speech-recordings    # optional
+    AWS_ACCESS_KEY_ID= / AWS_SECRET_ACCESS_KEY=   # leave empty to use an IAM role (recommended)
+    RECORDING_LOCAL_PATH=/srv/meetly/recording-staging   # staging folder on local disk
+  At startup the log shows "Speaking clips are uploaded to s3://<bucket>/<prefix> (IAM role credentials)"
+  (or "access-key credentials"). If the bucket is missing or unreachable, an error is logged.
+  Production without AWS_REGION/AWS_S3_BUCKET refuses to start; it never falls back to local disk silently.
+  Moving an existing installation from LOCAL to S3: copy the earlier clips once, then switch:
+    aws s3 sync <RECORDING_LOCAL_PATH> s3://<bucket>/<prefix> --exclude "*.part"
+
+
+--------------------------------------------------------------------------------
+5. S3 SETUP REQUIREMENTS
+--------------------------------------------------------------------------------
+- Create the bucket yourself, in AWS_REGION. The application never creates it.
+- Turn on "Block all public access". There is no bucket policy for anonymous
+  access and no ACLs; playback uses presigned URLs only.
+- Default encryption: SSE-S3 (or SSE-KMS; then also grant kms:Decrypt and
+  kms:GenerateDataKey to the role).
+- Bucket CORS is not needed: browsers follow redirects in <video>/<audio> and
+  in the download link, and no fetch() is used.
+- IAM policy for the server's role (or the key's user), least privilege:
+    s3:PutObject, s3:GetObject  on  arn:aws:s3:::your-private-bucket/speech-recordings/*
+    s3:ListBucket               on  arn:aws:s3:::your-private-bucket   (startup existence check)
+- Instance metadata (EC2): IMDSv2 hop limit 2 when the API runs in Docker.
+- Optional: a lifecycle rule for retention, and versioning against accidental
+  overwrite.
+
+
+--------------------------------------------------------------------------------
+6. TEST RESULTS (executed 2026-11-02 on this PC; evidence, not estimates)
+--------------------------------------------------------------------------------
+Baseline before the change: backend 163 run, 0 failed, 1 skipped; web 186/186.
+
+FINAL VERIFICATION (after the QA fixes)
+  Backend full regression: ./mvnw -B verify -> BUILD SUCCESS
+    Tests run: 177, Failures: 0, Errors: 0, Skipped: 1   (163 existing + 14 new)
+  Web: typecheck OK, lint OK, 28 files / 189 tests passed, production build OK
+  docker compose config: valid with .env and with .env.example
+  IAM-role end-to-end check: IAM_ROLE_PATH_OK (see QA-1)
+
+First run (before the QA fixes): backend 174 run (163 + 11), 0 failed, 1 skipped.
+  Skipped: LiveKitMediaAdapterLiveTest (needs a live LiveKit server; skipped at baseline too)
+  Database: real PostgreSQL 17 (Testcontainers).
+
+New storage tests (all passed):
+  SpeechRecordingLocalStorageIntegrationTest
+    - Clip saved on the D: drive (folder inside the project on D:), correct
+      DD-MM-YYYY/Meeting/Participant/name layout, size matches the database,
+      streamed by the API (200, inline), no S3 involved.
+    - The dev profile resolves to D:/MeetingApplication/Recordings, and
+      RECORDING_LOCAL_PATH overrides it.
+  SpeechRecordingS3StorageIntegrationTest (real MinIO server in Docker, standing in for AWS S3)
+    - Upload uses the same folder layout as the key; COMPLETED only after the
+      upload; object size and content type are correct; the staging copy is removed.
+    - S3 failure (bucket removed): finish returns 503, the clip stays RECORDING
+      with its local file; once storage is back, a retry gives COMPLETED and
+      the object exists.
+    - Recovery: with S3 down the clip stays RECORDING (never INCOMPLETE without
+      its object); after storage returns it becomes INCOMPLETE and is uploaded.
+    - Playback: 302 to a presigned URL (no-store); the bytes play inline;
+      download is an attachment with the file name; an unsigned object URL
+      gives 403 (private); a tampered API link gives 403.
+    - Non-Latin (Hindi) meeting and participant names: the folder names are
+      kept in the key, and the download works (QA-7).
+  SpeechClipObjectStoreTest (unit)
+    - Case-insensitive values; invalid type or missing region/bucket stops
+      startup; an unreachable endpoint gives STORAGE_UNAVAILABLE; the prod
+      profile defaults to S3; an empty value means S3 with prod, LOCAL
+      otherwise (QA-4).
+  SpeechClipCredentialsTest (unit)
+    - Access keys are used when set; otherwise exactly the IAM role provider (QA-1).
+  Mutation check: with the upload disabled in the code, the S3 test class
+  failed (4 of 4), so the tests do detect a missing upload. Code restored and
+  byte-identical.
+  Existing SpeechRecordingIntegrationTest, RecordingLifecycle, RecordingAccess,
+  RecordingConsent, AutoRecording and SpeakerStats tests: all passed (part of the 177).
+
+Web (Node 24 container; Node is not installed on this PC):
+  typecheck OK, lint OK, unit tests: 28 files, 189 passed (186 existing + 3 new)
+  production build OK; VITE_SPEAKING_RELEASE_MS=1500 is inlined in the bundle;
+  the default build resolves to 600.
+  Active speaker coverage (existing + new unit tests): one speaker, several
+  speakers at once, mic on without speech, mic off (immediate), stale report
+  after unmute, lost connection, reconnect clearing (stage and audience rooms),
+  participant leaving while speaking, rapid speech/silence (no flicker),
+  large room (only the speaking tile re-renders), screen-share tiles never
+  framed, configurable threshold.
+
+NOT executed (no live stack here) - must be run before release:
+  - Real AWS S3 bucket and a real IAM role (MinIO and a simulated role
+    endpoint were used).
+  - Live Playwright suites e2e/live/05-active-speaker.spec.ts (background
+    noise, privacy and visibility modes with real browsers) and
+    06-speech-clips.spec.ts.
+  - A two-device meeting through docker compose.
+
+
+--------------------------------------------------------------------------------
+7. INDEPENDENT QA FINDINGS AND RESOLUTION
+--------------------------------------------------------------------------------
+QA-1  HIGH - CONFIRMED - FIXED.  IAM-role credentials never worked.
+      Cause: ChainedProvider(AwsEnvironmentProvider, IamAwsProvider). MinIO's
+      chain only skips a provider on ProviderException, but
+      AwsEnvironmentProvider throws NullPointerException (keys unset) or
+      IllegalArgumentException (keys empty, as docker-compose passes them).
+      The chain aborted before the IAM role was tried. Reproduced with a
+      standalone program against minio 8.6.0 (both cases aborted).
+      Fix: IamAwsProvider is used on its own when no keys are configured;
+      configured keys use StaticProvider.
+      Evidence:
+        - SpeechClipCredentialsTest: static keys are fetched as configured; for
+          null, empty, blank or half-set keys the provider is exactly
+          IamAwsProvider (not a chain).
+        - End-to-end check (manual, scratchpad program): no keys configured,
+          AWS_CONTAINER_CREDENTIALS_FULL_URI pointing at a local stand-in for
+          the ECS task-role endpoint, real SpeechClipObjectStore -> MinIO:
+          "credential endpoint calls=1 uploaded size=7 presigned GET=200
+          IAM_ROLE_PATH_OK". The EC2 instance-profile (IMDSv2) and EKS
+          web-identity variants use the same provider but were not exercised.
+      The weak test "withoutKeysTheIamRoleChain..." was replaced; it had only
+      checked construction.
+
+QA-2  MEDIUM - FIXED.  The upload runs inside the finish transaction.
+      Fix: the S3 client now uses 10 s connect and 2 min read/write timeouts
+      instead of OkHttp's 5-minute defaults, so a stalled S3 frees the
+      connection quickly. The clip stays RECORDING and is retried.
+      Evidence: unit test "unreachable bucket -> STORAGE_UNAVAILABLE" (fast
+      failure) and the full suite. A slow-network soak test was not run.
+
+QA-3  MEDIUM - DOCUMENTED.  LOCAL -> S3 switch: earlier clips exist only on disk.
+      Fix: a migration step ("aws s3 sync ... --exclude *.part"; the layout is
+      identical) in .env.example, docs/07-deployment.md and section 4 of
+      this report. No code change (no schema change, as planned).
+
+QA-4  MEDIUM - FIXED.  Compose defaulted to LOCAL, overriding the prod default.
+      Fix: compose passes RECORDING_STORAGE_TYPE through empty when unset; an
+      empty value means S3 with the prod profile, LOCAL otherwise. Production
+      without a bucket now refuses to start instead of silently using local
+      disk. An explicit LOCAL in production is honoured with a warning.
+      Evidence: SpeechClipObjectStoreTest "anEmptyTypeFollowsTheProfile..."
+      and "theProductionProfileDefaultsToS3"; docker compose config renders
+      your local .env as LOCAL with the D:/MeetingApplication/Recordings mount.
+
+QA-5  LOW - ACCEPTED (no change).  A permanently failing upload is retried
+      every minute with a warning, and the free-space check eventually
+      protects the disk. This is the existing rule for storage errors.
+      Recommendation: alert on "Could not recover speaking clip" log lines or
+      on the number of RECORDING clips older than 10 minutes.
+
+QA-6  LOW - ACCEPTED (no change).  Empty staging folders remain after upload.
+      Harmless; can be cleaned with a periodic find -type d -empty -delete.
+
+QA-7  LOW - FIXED.  S3 test with non-Latin names.
+      Evidence: SpeechRecordingS3StorageIntegrationTest
+      "nonLatinMeetingAndParticipantNames..." (meeting "साप्ताहिक बैठक",
+      participant "आशा देवी"): key .../साप्ताहिक_बैठक/आशा_देवी/..., the object
+      size matches, and the presigned download returns 200 with the WebM bytes.
+
+QA-8  INFO.  Active speaker was already implemented; only the threshold became
+      configurable. Live browser suites were not re-run here.
+
+QA-9  INFO.  Cloud recordings (Egress) are unchanged (out of scope by the default
+      decision). Moving them to AWS S3 is a separate change: egress.yaml
+      S3 settings plus the same IAM handling in MinioObjectStorage.
+
+
+--------------------------------------------------------------------------------
+8. REMAINING ISSUES
+--------------------------------------------------------------------------------
+- Not tested against a real AWS account. MinIO stood in for S3, and the IAM
+  role was simulated through the container-credentials endpoint. Before go-live,
+  do one upload and playback on the real server (the startup log line confirms
+  which credentials are used).
+- Live Playwright suites (05-active-speaker, 06-speech-clips) and a two-device
+  meeting were not run on this PC (no Node, no running stack).
+- QA-5 / QA-6 accepted as documented.
+- Nothing is committed to git yet. This work and the earlier infrastructure
+  changes are in the working tree; .env (local) was edited but is git-ignored.
+================================================================================

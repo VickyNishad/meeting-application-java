@@ -37,10 +37,14 @@ public final class SpeechRecordingDtos {
     }
 
     /** The values the list can be filtered by, within what the viewer may see. */
-    public record Facets(List<Option> meetings, List<Option> participants, List<String> dates) {
+    public record Facets(List<Option> meetings, List<ParticipantOption> participants, List<String> dates) {
     }
 
     public record Option(UUID id, String label) {
+    }
+
+    /** A participant filter value and the meeting it participated in (the participant filter follows the meeting). */
+    public record ParticipantOption(UUID id, String label, UUID meetingId) {
     }
 
     public record AccessUrl(String url, Instant expiresAt) {

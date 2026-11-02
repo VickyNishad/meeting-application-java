@@ -8,8 +8,10 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 ARG VITE_API_BASE_URL=/api/v1
 ARG VITE_PUBLIC_APP_URL=
+ARG VITE_SPEAKING_RELEASE_MS=
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL \
-    VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL
+    VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL \
+    VITE_SPEAKING_RELEASE_MS=$VITE_SPEAKING_RELEASE_MS
 RUN npm run build
 
 # ---- Runtime stage -------------------------------------------------------------------------------

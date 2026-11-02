@@ -1,11 +1,22 @@
 import { useEffect, useLayoutEffect, useState } from 'react';
 import { ConnectionQuality, ParticipantEvent, RoomEvent, Track, type Participant, type Room } from 'livekit-client';
 
+const DEFAULT_SPEAKING_RELEASE_MS = 600;
+
+/** A silence threshold from configuration: whole milliseconds 0–10000, anything else falls back to the default. */
+export function releaseMsFrom(value: string | undefined, fallback = DEFAULT_SPEAKING_RELEASE_MS): number {
+  if (value === undefined || !/^\s*\d+\s*$/.test(value)) return fallback;
+  const ms = Number(value);
+  return ms <= 10_000 ? ms : fallback;
+}
+
 /**
  * How long a tile stays highlighted after its speaker goes quiet (the silence threshold). Bridges the pauses between
  * words so the border does not flicker; the media server already smooths its own detection (livekit `audio:` config).
+ * Configurable at build time with VITE_SPEAKING_RELEASE_MS (default 600). Only the tile border uses it: speaking
+ * clips pass their own threshold (useSpeechRecorder's CLIP_RELEASE_MS), so recording is unaffected.
  */
-export const SPEAKING_RELEASE_MS = 600;
+export const SPEAKING_RELEASE_MS = releaseMsFrom(import.meta.env.VITE_SPEAKING_RELEASE_MS);
 
 /**
  * After a microphone is turned back on, the last "speaking" report is from before it was turned off: it is ignored

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { Download, Loader2, Mic, Play } from 'lucide-react';
+import { CalendarDays, Download, Loader2, Mic, Play } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Badge, Card, NativeSelect } from '@/components/ui/primitives';
@@ -9,7 +9,7 @@ import { EmptyState, ErrorState, ListSkeleton, Pagination } from '@/components/c
 import { speechRecordingsApi } from '@/lib/api/endpoints';
 import { errorMessage } from '@/lib/api/problem';
 import type { SpeechRecording, SpeechRecordingView } from '@/lib/api/types';
-import { formatDateTime } from '@/lib/time';
+import { browserTimeZone, dateKeyInZone, formatDateTime } from '@/lib/time';
 import { cn, formatBytes, formatDuration } from '@/lib/utils';
 
 function statusVariant(s: SpeechRecording['status']) {
@@ -20,6 +20,42 @@ function statusVariant(s: SpeechRecording['status']) {
 }
 
 const playable = (c: SpeechRecording) => c.status === 'COMPLETED' || c.status === 'INCOMPLETE';
+/** YYYY-MM-DD (the API's date) as DD-MM-YYYY (how dates are shown, like the clip folders). */
+const dmy = (d: string) => d.split('-').reverse().join('-');
+
+/**
+ * A calendar for any date, next to the date dropdown (which lists only dates that have clips). Opens the browser's
+ * own date picker; the input sits under the button so the picker appears there.
+ */
+function DatePickerButton({ value, onChange }: { value: string; onChange: (date: string) => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  const open = () => {
+    const el = input.current;
+    if (!el) return;
+    try {
+      el.showPicker();
+    } catch {
+      el.focus(); // browsers without showPicker(): the focused date field takes keyboard input
+    }
+  };
+  return (
+    <div className="relative shrink-0">
+      <input
+        ref={input}
+        type="date"
+        tabIndex={-1}
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 size-full opacity-0"
+        value={value}
+        max={dateKeyInZone(new Date(), browserTimeZone())}
+        onChange={(e) => e.target.value && onChange(e.target.value)}
+      />
+      <Button type="button" size="icon" variant="outline" aria-label="Choose a date from the calendar" title="Choose a date" onClick={open}>
+        <CalendarDays aria-hidden="true" />
+      </Button>
+    </div>
+  );
+}
 const seconds = (ms?: number | null) => (ms == null ? undefined : Math.round(ms / 1000));
 
 function ClipPlayer({ clip, onClose }: { clip: SpeechRecording | null; onClose: () => void }) {
@@ -109,6 +145,25 @@ export function SpeakingClips({ className }: { className?: string }) {
     set(e.target.value);
     setPage(0);
   };
+  const pickDate = (d: string) => {
+    setDate(d);
+    setPage(0);
+  };
+  // The participant filter follows the meeting filter: a participant is one participation in one meeting.
+  const allParticipants = facets.data?.participants;
+  const participantOptions = useMemo(
+    () => (meetingId ? allParticipants?.filter((p) => p.meetingId === meetingId) : allParticipants) ?? [],
+    [allParticipants, meetingId],
+  );
+  const changeMeeting = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = e.target.value;
+    setMeetingId(next);
+    // A selected participant from another meeting would only ever match nothing: clear it.
+    if (participantId && next && !allParticipants?.some((p) => p.id === participantId && p.meetingId === next)) {
+      setParticipantId('');
+    }
+    setPage(0);
+  };
 
   const download = async (c: SpeechRecording) => {
     setDownloading(c.id);
@@ -146,15 +201,20 @@ export function SpeakingClips({ className }: { className?: string }) {
       </div>
 
       <div className="mt-4 grid gap-2 sm:grid-cols-3">
-        <NativeSelect aria-label="Filter by date" value={date} onChange={filter(setDate)}>
-          <option value="">All dates</option>
-          {facets.data?.dates.map((d) => (
-            <option key={d} value={d}>
-              {d.split('-').reverse().join('-')}
-            </option>
-          ))}
-        </NativeSelect>
-        <NativeSelect aria-label="Filter by meeting" value={meetingId} onChange={filter(setMeetingId)}>
+        <div className="flex gap-2">
+          <NativeSelect aria-label="Filter by date" value={date} onChange={filter(setDate)} className="min-w-0 flex-1">
+            <option value="">All dates</option>
+            {/* A date picked in the calendar that has no clips is still shown as the selection. */}
+            {date && !facets.data?.dates.includes(date) && <option value={date}>{dmy(date)} (custom)</option>}
+            {facets.data?.dates.map((d) => (
+              <option key={d} value={d}>
+                {dmy(d)}
+              </option>
+            ))}
+          </NativeSelect>
+          <DatePickerButton value={date} onChange={pickDate} />
+        </div>
+        <NativeSelect aria-label="Filter by meeting" value={meetingId} onChange={changeMeeting}>
           <option value="">All meetings</option>
           {facets.data?.meetings.map((m) => (
             <option key={m.id} value={m.id}>
@@ -162,15 +222,34 @@ export function SpeakingClips({ className }: { className?: string }) {
             </option>
           ))}
         </NativeSelect>
-        <NativeSelect aria-label="Filter by participant" value={participantId} onChange={filter(setParticipantId)}>
-          <option value="">All participants</option>
-          {facets.data?.participants.map((p) => (
+        <NativeSelect
+          aria-label="Filter by participant"
+          value={participantId}
+          onChange={filter(setParticipantId)}
+          disabled={facets.isPending || (!!meetingId && participantOptions.length === 0)}
+        >
+          {facets.isPending ? (
+            <option value="">Loading participants…</option>
+          ) : meetingId && participantOptions.length === 0 ? (
+            <option value="">No participants in this meeting</option>
+          ) : (
+            <option value="">All participants</option>
+          )}
+          {participantOptions.map((p) => (
             <option key={p.id} value={p.id}>
               {p.label}
             </option>
           ))}
         </NativeSelect>
       </div>
+      {facets.isError && (
+        <p role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-sm text-destructive">
+          The filter options could not be loaded: {errorMessage(facets.error)}
+          <Button size="sm" variant="outline" onClick={() => void facets.refetch()}>
+            Retry
+          </Button>
+        </p>
+      )}
 
       <div className="mt-4">
         {q.isPending ? (

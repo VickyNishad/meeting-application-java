@@ -18,3 +18,11 @@ loadtest/results/
 !.vscode/extensions.json
 .DS_Store
 Thumbs.db
+
+# runtime data written by the Docker stack and the API (database dumps, Redis, MinIO, recordings)
+docker/backups/
+docker/redis/
+docker/minio/
+docker/Recordings/
+Recordings/
+data/

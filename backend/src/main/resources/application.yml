@@ -152,7 +152,20 @@ app:
     default-retention-days: ${APP_RECORDING_RETENTION_DAYS:90}
     file-prefix: recordings
   speech-recordings:
-    storage-path: ${RECORDING_STORAGE_PATH:./data/Recordings}
+    # LOCAL: clips are kept in storage-path. S3: storage-path is a staging folder; finished clips go to the private
+    # bucket below, same DD-MM-YYYY/<Meeting>/<Participant>/<file> layout (see SpeechClipObjectStore).
+    # Empty = S3 with the prod profile, LOCAL otherwise.
+    storage-type: ${RECORDING_STORAGE_TYPE:}
+    storage-path: ${RECORDING_LOCAL_PATH:${RECORDING_STORAGE_PATH:./data/Recordings}}
+    s3:
+      region: ${AWS_REGION:}
+      bucket: ${AWS_S3_BUCKET:}
+      prefix: ${AWS_S3_PREFIX:}
+      # Empty = AWS (https://s3.<region>.amazonaws.com). Only set for an S3-compatible server (tests, MinIO).
+      endpoint: ${AWS_S3_ENDPOINT:}
+      # Empty = the server's IAM role (instance profile / task role / web identity). Prefer the role in production.
+      access-key: ${AWS_ACCESS_KEY_ID:}
+      secret-key: ${AWS_SECRET_ACCESS_KEY:}
     min-free-bytes: ${RECORDING_MIN_FREE_BYTES:209715200}
     max-chunk-bytes: 8388608
     max-clip-bytes: 524288000

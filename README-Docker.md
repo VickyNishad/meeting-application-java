@@ -76,8 +76,9 @@ then run `wsl --shutdown` and restart Docker Desktop.
 
 - **Disk:** *Settings > Resources > Advanced > Disk image location*. Move it to `D:\` to keep PostgreSQL data off
   the system drive (the database volume lives in that disk image).
-- **File sharing:** the compose file bind-mounts `D:/meetly/docker` (backups, Redis, MinIO). Make sure the D: drive
-  exists or set `DATA_ROOT` in `.env` to another folder.
+- **File sharing:** the compose file bind-mounts `DATA_ROOT` (default `./docker` next to `docker-compose.yml`) for
+  backups, Redis, MinIO and recordings. These folders are git-ignored. Set `DATA_ROOT` in `.env` to put them
+  elsewhere (e.g. `D:/meetly/docker`).
 
 ## 3. What is in the project
 
@@ -199,9 +200,9 @@ user `app`. Java runs as PID 1 (exec-form `ENTRYPOINT`), so `docker compose stop
 shuts down gracefully. Memory: `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75` of the container limit (2 GB in
 docker-compose.yml). The API listens on 8080 inside the network only; the web container proxies `/api`.
 
-Profiles: the containers run with no Spring profile (production-like settings from environment variables). To use
-one, add `SPRING_PROFILES_ACTIVE: <name>` under `backend.environment`. Do not use `dev` in Docker: it stores files
-under `D:\meetly`, a Windows path that does not exist inside the container.
+Profiles: the backend runs the `prod` Spring profile unless `.env` sets `SPRING_PROFILES_ACTIVE` (empty = no
+profile, which honours `APP_COOKIE_SECURE` / `APP_OPENAPI_ENABLED` for plain-http local use). Do not use `dev` in
+Docker: it stores files on the container's local disk instead of MinIO.
 
 Health: `docker compose ps` shows `backend` as *healthy* once `/actuator/health/readiness` is UP (it checks the
 database).
@@ -266,7 +267,7 @@ docker inspect --format "{{.State.Health.Status}}" meet-platform-postgres-1
 
 ### Backup
 
-The `pg-backup` service writes a dump every 24 hours to `D:\meetly\docker\backups` (kept 14 days). A manual
+The `pg-backup` service writes a dump every 24 hours to `DATA_ROOT\backups` (default `.\docker\backups`, git-ignored; kept 14 days). A manual
 backup: dump inside the container, then copy the file out. This never passes binary data through the terminal, so
 the file is the same in cmd and PowerShell (`>` in Windows PowerShell 5.1 would corrupt it).
 
@@ -308,7 +309,7 @@ Check first that the API's Flyway version supports the new PostgreSQL version.
 
 Speaking clips (one `.webm` per participant per speaking turn) are plain files, not in the database: the backend
 writes them to `RECORDING_STORAGE_PATH`, which docker-compose.yml sets to `/data/recordings` and bind-mounts from the
-host folder `DATA_ROOT/Recordings` (default `D:meetlydockerRecordings`). They survive rebuilding, recreating and
+host folder `DATA_ROOT/Recordings` (default `./docker/Recordings`). They survive rebuilding, recreating and
 restarting containers, and `docker compose down -v` does not touch them (it is not a Docker volume). Layout:
 `DD-MM-YYYY<Meeting_Title><Participant_Name>DDMMYYHHmmss_<id>.webm`. Back them up by copying that folder; the
 database keeps their metadata (`speech_recordings` table) and a database backup alone does not contain the media.
@@ -398,8 +399,14 @@ Optional tools stay out of docker-compose.yml so a normal start runs only what t
 This setup is for local development:
 
 - `.env` holds real secrets: it is in `.gitignore`; only `.env.example` (placeholders) is shared.
-- PostgreSQL, pgAdmin, Redis and the other admin ports are bound to `127.0.0.1`. Reachable from the network are
-  only what browsers need: the web app (3000), LiveKit (7880, 7881, UDP 50000-50100) and MinIO's S3 port (9000).
+- PostgreSQL, pgAdmin, Redis, the API (8080), MinIO (9000, 9001) and the other admin ports are bound to
+  `127.0.0.1`. Reachable from the network are only what browsers need: the web app (3000) and LiveKit (7880, 7881,
+  UDP 50000-50100, TURN UDP 3478). Set `S3_BIND_ADDRESS=0.0.0.0` if other devices must download recordings
+  directly from MinIO.
+- The backend runs the `prod` Spring profile by default. The local `.env` sets `SPRING_PROFILES_ACTIVE=` (empty)
+  so that plain-http cookies and Swagger work on this PC.
+- Runtime data (`docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings`) is git-ignored: database
+  dumps contain user data and must never be committed.
 - All services share one private bridge network (`meet-platform-net`) and talk by service name.
 - The API container runs as the non-root user `app`. Other images run as their image's default user (nginx and
   MinIO as root). No container runs `privileged`, but the `egress` recording worker is granted the `SYS_ADMIN`
@@ -408,5 +415,6 @@ This setup is for local development:
 
 For production additionally: a managed or dedicated PostgreSQL with TLS, regular tested backups and point-in-time
 recovery; secrets from a secret manager instead of `.env`; no pgAdmin (or pgAdmin behind VPN/SSO only); HTTPS in
-front of the web app and `wss://` for LiveKit; image tags pinned and scanned; resource limits sized from load
-tests. See docs/07-deployment.md.
+front of the web app and `wss://` for LiveKit (`docker compose --profile tls up -d` adds Caddy for this, see
+`infra/caddy/Caddyfile`); `LIVEKIT_NODE_IP` set to the public IP and `LIVEKIT_TURN_ENABLED=true`; image tags pinned
+and scanned; resource limits sized from load tests. See docs/07-deployment.md.

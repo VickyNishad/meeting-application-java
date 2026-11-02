@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, renderHook } from '@testing-library/react';
 import { ConnectionQuality, ParticipantEvent, Track, type Participant } from 'livekit-client';
-import { FRESH_REPORT_MS, SPEAKING_RELEASE_MS, SpeakingHold, isSpeakingNow, useClearSpeakingOnReconnect, useSpeakingIndicator } from './speaking';
+import { FRESH_REPORT_MS, SPEAKING_RELEASE_MS, releaseMsFrom, SpeakingHold, isSpeakingNow, useClearSpeakingOnReconnect, useSpeakingIndicator } from './speaking';
 import { RoomEvent, type Room } from 'livekit-client';
 
 /** A participant as the media server reports it: speaking state, microphone state, connection quality, events. */
@@ -294,5 +294,34 @@ describe("routine events during a pause (found by the live speaking-clip test)",
     act(() => p.speak(true));
     act(() => vi.advanceTimersByTime(SPEAKING_RELEASE_MS * 2));
     expect(result.current).toBe(true);
+  });
+});
+
+describe('configurable silence threshold (VITE_SPEAKING_RELEASE_MS)', () => {
+  it('defaults to 600 ms when unset (the build used for these tests sets nothing)', () => {
+    expect(SPEAKING_RELEASE_MS).toBe(600);
+    expect(releaseMsFrom(undefined)).toBe(600);
+    expect(releaseMsFrom('')).toBe(600);
+  });
+
+  it('accepts whole milliseconds from 0 to 10000 and falls back on anything else', () => {
+    expect(releaseMsFrom('1200')).toBe(1200);
+    expect(releaseMsFrom(' 0 ')).toBe(0);
+    expect(releaseMsFrom('10000')).toBe(10000);
+    for (const bad of ['10001', '-5', '1.5', 'abc', '600ms']) expect(releaseMsFrom(bad)).toBe(600);
+  });
+
+  it('a custom threshold is what the tile waits before removing the border', () => {
+    vi.useFakeTimers();
+    const shown: boolean[] = [];
+    const hold = new SpeakingHold(releaseMsFrom('1500'), (s) => shown.push(s));
+    hold.update(true);
+    hold.update(false);
+    vi.advanceTimersByTime(1499);
+    expect(shown).toEqual([true]);
+    vi.advanceTimersByTime(1);
+    expect(shown).toEqual([true, false]);
+    hold.dispose();
+    vi.useRealTimers();
   });
 });

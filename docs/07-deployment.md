@@ -60,9 +60,17 @@ With nginx, forward `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwar
 upgrades for the media host. The API runs `server.forward-headers-strategy=native` and trusts forwarded headers
 only from private-network proxies.
 
+The Compose stack ships this as an opt-in service: `docker compose --profile tls up -d` starts Caddy with
+`infra/caddy/Caddyfile` (web + API + LiveKit signalling on `SITE_DOMAIN`, presigned S3 URLs on `S3_DOMAIN`). The
+file lists the matching `.env` values.
+
 ### LiveKit production settings
-* `rtc.use_external_ip: true` (or explicit `node_ip`) so the public address is advertised.
-* Open UDP `50000-60000` (or the configured range) and TCP `7881` to each node; TCP is the fallback when UDP is blocked.
+* `rtc.use_external_ip: true` (or explicit `node_ip`) so the public address is advertised. In Compose:
+  `LIVEKIT_NODE_IP=<public IP>` or `LIVEKIT_USE_EXTERNAL_IP=true`.
+* Open UDP `50000-50100` (the Compose range; `rtc.port_range_*` and the published ports must match) and TCP `7881`
+  to each node; TCP is the fallback when UDP is blocked.
+* Compose: `LIVEKIT_TURN_ENABLED=true` and `LIVEKIT_TURN_DOMAIN` enable the embedded TURN relay on UDP `3478`.
+  TURN over TLS (below) additionally needs a certificate.
 * Enable TURN: `turn.enabled: true`, `turn.domain: turn.example.com`, `turn.tls_port: 5349`, `turn.udp_port: 3478`,
   with a certificate for `turn.example.com` — needed for clients behind restrictive firewalls/proxies.
 * Webhook URL: `https://meet.example.com/api/v1/webhooks/livekit` (or the internal API address).
@@ -70,10 +78,24 @@ only from private-network proxies.
 
 ### Environment
 All configuration is environment-driven (`.env.example` lists every variable). Production must set:
-`APP_PUBLIC_URL`, `APP_CORS_ALLOWED_ORIGINS`, `APP_JWT_SECRET`, `APP_COOKIE_SECURE=true`,
+`SPRING_PROFILES_ACTIVE=prod` (the Compose default), `APP_PUBLIC_URL`, `APP_CORS_ALLOWED_ORIGINS`, `APP_JWT_SECRET`, `APP_COOKIE_SECURE=true`,
 `APP_OPENAPI_ENABLED=false` (the default), `APP_METRICS_SCRAPE_PASSWORD` (if Prometheus scrapes the API),
 DB/Redis/S3/LiveKit/SMTP credentials, `LIVEKIT_PUBLIC_URL=wss://…`,
 `S3_PUBLIC_ENDPOINT=https://…`.
+
+### Speaking-clip storage (LOCAL / S3)
+* `RECORDING_STORAGE_TYPE=LOCAL` (development, Windows): clips stay in `RECORDING_LOCAL_PATH`
+  (`D:/MeetingApplication/Recordings`) as `DD-MM-YYYY/<Meeting>/<Participant>/DDMMYYHHmmss_<id>.webm`.
+* `RECORDING_STORAGE_TYPE=S3` (production, the `prod` profile's default): `RECORDING_LOCAL_PATH` is a staging folder;
+  each verified clip is uploaded to `s3://$AWS_S3_BUCKET/$AWS_S3_PREFIX/<same path>` before it is marked COMPLETED.
+  An upload failure keeps it RECORDING and the recovery job retries every minute. Playback redirects to presigned URLs.
+* Bucket: create it yourself (never created by the API), "Block all public access" on, default encryption on.
+  Role/user policy: `s3:PutObject`, `s3:GetObject` on `arn:aws:s3:::<bucket>/<prefix>/*`, `s3:ListBucket` on the
+  bucket. Prefer an IAM role (EC2 instance profile with IMDSv2 hop limit 2 under Docker, ECS task role, EKS IRSA)
+  and leave `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` empty.
+* Switching an existing installation from LOCAL to S3: earlier clips only exist on disk and would 404 on playback.
+  Copy them once (the layout is identical), then switch:
+  `aws s3 sync <RECORDING_LOCAL_PATH> s3://<bucket>/<prefix> --exclude "*.part"`.
 
 ### Health and readiness
 * Liveness: `GET /actuator/health/liveness`
@@ -99,12 +121,12 @@ LiveKit node scaling: run the API as a Deployment with HPA on CPU and p95 latenc
 
 ### Docker Compose on Windows: data on the D: drive
 
-- `DATA_ROOT` (`.env`, default `D:/meetly/docker`) holds `minio/` (recordings and shared files), `redis/` and `backups/`. Folders are created on first start. Prometheus and Grafana keep named volumes (their containers run as non-root users).
+- `DATA_ROOT` (`.env`, default `./docker`, git-ignored; e.g. `D:/meetly/docker` or `/srv/meetly`) holds `minio/` (recordings and shared files), `redis/` and `backups/`. Folders are created on first start. Prometheus and Grafana keep named volumes (their containers run as non-root users).
 - PostgreSQL stays in the named volume `pgdata`: a data directory bind-mounted from NTFS fails on ownership/fsync. To keep it on D: as well, set Docker Desktop > Settings > Resources > Advanced > *Disk image location* to a folder on D: before the first `docker compose up`.
 - The `pg-backup` service writes `DATA_ROOT/backups/meet-YYYYMMDD-HHMMSS.dump` once a day and keeps 14 days. Restore into the running stack:
 
   ```powershell
-  Get-Content -AsByteStream D:meetlydockerackupsmeet-20261030-030000.dump | docker compose exec -T postgres pg_restore -U meet -d meet --clean --if-exists
+  Get-Content -AsByteStream .\docker\backups\meet-20261030-030000.dump | docker compose exec -T postgres pg_restore -U meet -d meet --clean --if-exists
   ```
 - Set `APP_METRICS_SCRAPE_PASSWORD`: the API serves `/actuator/prometheus` only to that credential, and Prometheus reads it as a compose secret.
 

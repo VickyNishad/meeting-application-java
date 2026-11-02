@@ -1,6 +1,6 @@
 # 01 — Business Requirements and Acceptance Criteria
 
-Source: `script.txt` (master development prompt). Each requirement has an id used by the implementation
+Source: `docs/00-original-brief.md` (master development prompt). Each requirement has an id used by the implementation
 checklist (`05-implementation-checklist.md`) and by tests.
 
 ## Actors and roles

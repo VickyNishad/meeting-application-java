@@ -3,7 +3,8 @@
 # Run from PowerShell:   powershell -ExecutionPolicy Bypass -File .\start-local.ps1
 #   -Build   rebuild the API jar first (needed after backend code changes)
 # Then open http://127.0.0.1:5173
-# The API runs with the "dev" Spring profile: recordings and files are stored under D:\meetly.
+# The API runs with the "dev" Spring profile: recordings and files are stored under .\data
+# relative to the API's working directory (override with APP_STORAGE_LOCAL_ROOT / RECORDING_STORAGE_PATH).
 param([switch]$Build)
 $tools = "$env:USERPROFILE\.meet-tools"
 $jar = "$PSScriptRoot\backend\target\meet-platform-0.1.0-SNAPSHOT.jar"

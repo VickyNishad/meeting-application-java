@@ -1,0 +1,31 @@
+# HTTPS entry point (docker compose --profile tls). Caddy obtains and renews Let's Encrypt certificates for public
+# domains; for "localhost" names it uses its own local CA. Browsers only allow camera/microphone over HTTPS.
+#
+# .env for a server reachable as meet.example.com (DNS for both names points at this host, ports 80/443 open):
+#   SITE_DOMAIN=meet.example.com          S3_DOMAIN=s3.meet.example.com
+#   APP_PUBLIC_URL=https://meet.example.com
+#   APP_CORS_ALLOWED_ORIGINS=https://meet.example.com
+#   APP_CALENDAR_CALLBACK_BASE_URL=https://meet.example.com
+#   LIVEKIT_PUBLIC_URL=wss://meet.example.com
+#   S3_PUBLIC_ENDPOINT=https://s3.meet.example.com
+
+{$SITE_DOMAIN} {
+	encode zstd gzip
+
+	# LiveKit signalling WebSocket (media itself flows over UDP 50000-50100 / TCP 7881 / TURN 3478).
+	@livekit path /rtc /rtc/*
+	handle @livekit {
+		reverse_proxy livekit:7880
+	}
+
+	# Web app; its nginx forwards /api, /oauth2 and /login/oauth2 to the API.
+	handle {
+		reverse_proxy web:80
+	}
+}
+
+# Presigned recording and file URLs. The original Host header is kept (Caddy's default) because it is part of
+# the S3 signature.
+{$S3_DOMAIN} {
+	reverse_proxy minio:9000
+}
