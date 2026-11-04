@@ -1,4 +1,4 @@
-import type { JoinResponse, Meeting, MeetingRole, RoomStateView, ScreenSharePolicy, VisibilityMode } from '@/lib/api/types';
+import type { JoinResponse, MediaPermissions, Meeting, MeetingRole, ParticipantMedia, RoomStateView, ScreenSharePolicy, VisibilityMode } from '@/lib/api/types';
 import { TOPIC, isModeratorRole, parseModeration, parseRecording } from './roomData';
 
 /**
@@ -31,6 +31,10 @@ export interface RoomState {
   waitingCount: number;
   /** People in the session, counted by the server (one per person, reconnects and extra tabs included once). */
   presentCount: number;
+  /** Meeting-wide media permissions for participants (hosts and co-hosts always may publish). */
+  mediaPermissions: MediaPermissions;
+  /** Participants' media rights by participant id: everyone's for the host, otherwise only one's own. */
+  participantMedia: Record<string, ParticipantMedia>;
   /** Real names by identity (stage of a webinar, where the SFU shows attendees as "Attendee"). */
   names: Record<string, string>;
   stale: boolean;
@@ -48,11 +52,14 @@ export type RoomAction =
   /** Own hand, applied at once (the server's echo confirms it). */
   | { type: 'own-hand'; participantId: string; name: string; raised: boolean }
   /** A moderator's own change, shown at once; the server's signal or the next snapshot confirms or corrects it. */
-  | { type: 'patch'; patch: Partial<Pick<RoomState, 'locked' | 'screenSharePolicy' | 'waitingRoomEnabled' | 'chatEnabled' | 'cloudRecording'>> };
+  | { type: 'patch'; patch: Partial<Pick<RoomState, 'locked' | 'screenSharePolicy' | 'waitingRoomEnabled' | 'chatEnabled' | 'cloudRecording' | 'mediaPermissions'>> }
+  /** The host's own change of one participant's media rights (the server's answer). */
+  | { type: 'participant-media'; media: ParticipantMedia };
 
 const MAX_PENDING = 200;
 
-export function initialRoomState(meeting: Meeting, join: JoinResponse): RoomState {
+/** {@code myName}: this participant's own name, for a webinar attendee whom the media server shows as "Attendee". */
+export function initialRoomState(meeting: Meeting, join: JoinResponse, myName?: string): RoomState {
   return {
     loaded: false,
     epoch: null,
@@ -65,6 +72,13 @@ export function initialRoomState(meeting: Meeting, join: JoinResponse): RoomStat
     chatEnabled: meeting.chatEnabled !== false,
     screenSharePolicy: meeting.screenSharePolicy,
     waitingRoomEnabled: meeting.waitingRoomEnabled,
+    // Until the snapshot: everyone may use microphone and camera, screen sharing as the meeting says.
+    mediaPermissions: {
+      microphone: 'ALLOWED',
+      camera: 'ALLOWED',
+      screenShare: meeting.screenSharePolicy === 'HOSTS_ONLY' ? 'RESTRICTED' : 'ALLOWED',
+    },
+    participantMedia: {},
     // Known from the join response for everyone, guests included, until the snapshot arrives.
     cloudRecording: !!join.meeting.recordingInProgress,
     localRecorders: {},
@@ -72,7 +86,7 @@ export function initialRoomState(meeting: Meeting, join: JoinResponse): RoomStat
     roleOverrides: {},
     waitingCount: 0,
     presentCount: 0,
-    names: {},
+    names: myName ? { [join.participantId]: myName } : {},
     stale: false,
     pending: [],
   };
@@ -106,6 +120,8 @@ function fromSnapshot(state: RoomState, v: RoomStateView): RoomState {
     waitingCount: v.waitingCount ?? state.waitingCount,
     presentCount: v.presentCount ?? state.presentCount,
     names: v.participants ? byId(v.participants) : state.names,
+    mediaPermissions: v.mediaPermissions ?? state.mediaPermissions,
+    participantMedia: Object.fromEntries([...(v.participantMedia ?? []), ...(v.myMedia ? [v.myMedia] : [])].map((m) => [m.participantId, m])),
   };
 }
 
@@ -127,6 +143,18 @@ function applyContent(state: RoomState, topic: string, raw: Record<string, unkno
           };
         case 'waiting-room':
           return { ...state, waitingCount: p.count };
+        case 'media-permissions':
+          return {
+            ...state,
+            mediaPermissions: { microphone: p.microphone, camera: p.camera, screenShare: p.screenShare },
+            // The same setting as the screen-sharing policy.
+            screenSharePolicy: p.screenShare === 'ALLOWED' ? 'EVERYONE' : 'HOSTS_ONLY',
+          };
+        case 'participant-media':
+          return {
+            ...state,
+            participantMedia: { ...state.participantMedia, ...Object.fromEntries(p.participants.map((m) => [m.participantId, m])) },
+          };
         case 'role-changed': {
           const onStage = isModeratorRole(p.role);
           const stageIdentities = onStage
@@ -235,8 +263,17 @@ export function roomReducer(state: RoomState, action: RoomAction): RoomState {
       else delete raisedHands[action.participantId];
       return { ...state, raisedHands };
     }
-    case 'patch':
-      return { ...state, ...action.patch };
+    case 'patch': {
+      const next = { ...state, ...action.patch };
+      // The screen-sharing permission and policy are one setting.
+      if (action.patch.mediaPermissions) next.screenSharePolicy = action.patch.mediaPermissions.screenShare === 'ALLOWED' ? 'EVERYONE' : 'HOSTS_ONLY';
+      if (action.patch.screenSharePolicy) {
+        next.mediaPermissions = { ...next.mediaPermissions, screenShare: action.patch.screenSharePolicy === 'EVERYONE' ? 'ALLOWED' : 'RESTRICTED' };
+      }
+      return next;
+    }
+    case 'participant-media':
+      return { ...state, participantMedia: { ...state.participantMedia, [action.media.participantId]: action.media } };
   }
 }
 

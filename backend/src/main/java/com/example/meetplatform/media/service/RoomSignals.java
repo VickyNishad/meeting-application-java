@@ -77,6 +77,21 @@ public class RoomSignals {
     }
 
     /**
+     * {@link #broadcast}, sent now even inside a transaction: only for state that has already been committed (a caller
+     * running after commit that must keep its signals in order with its own SFU calls).
+     */
+    public void broadcastCommitted(String roomName, String topic, Map<String, ?> payload) {
+        deliver(roomName, topic, payload, List.of(), RoomSequence.STREAM_ALL);
+    }
+
+    /** {@link #sendTo}, sent now: see {@link #broadcastCommitted}. */
+    public void sendToCommitted(String roomName, String topic, Map<String, ?> payload, List<String> identities) {
+        if (!identities.isEmpty()) {
+            deliver(roomName, topic, payload, identities, null);
+        }
+    }
+
+    /**
      * Delivers to everyone in the room right now (not after commit) and throws
      * {@code MEDIA_PROVIDER_UNAVAILABLE} if the room cannot be notified. Used for recording consent: the
      * indicator must reach the room before capture starts, and capture must not start if it cannot.
@@ -124,14 +139,7 @@ public class RoomSignals {
         if (roomName == null) {
             return;
         }
-        Runnable delivery = () -> {
-            try {
-                byte[] bytes = jsonMapper.writeValueAsBytes(numbered(roomName, payload, stream));
-                media.sendData(roomName, topic, bytes, identities);
-            } catch (RuntimeException e) {
-                log.warn("Could not deliver '{}' signal to room {}: {}", topic, roomName, e.getMessage());
-            }
-        };
+        Runnable delivery = () -> deliver(roomName, topic, payload, identities, stream);
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
@@ -141,6 +149,18 @@ public class RoomSignals {
             });
         } else {
             delivery.run();
+        }
+    }
+
+    private void deliver(String roomName, String topic, Map<String, ?> payload, List<String> identities, String stream) {
+        if (roomName == null) {
+            return;
+        }
+        try {
+            byte[] bytes = jsonMapper.writeValueAsBytes(numbered(roomName, payload, stream));
+            media.sendData(roomName, topic, bytes, identities);
+        } catch (RuntimeException e) {
+            log.warn("Could not deliver '{}' signal to room {}: {}", topic, roomName, e.getMessage());
         }
     }
 

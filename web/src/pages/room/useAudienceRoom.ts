@@ -3,6 +3,7 @@ import { ConnectionState, Room, RoomEvent, type LocalParticipant, type RemotePar
 import type { AudienceRoomGrant } from '@/lib/api/types';
 import type { MediaState } from '@/lib/joinStore';
 import { isMediaDeviceError } from './mediaErrors';
+import { isPublishPermissionError } from './mediaRights';
 
 /**
  * The audience rooms of a HOST_AND_SELF_ONLY session (media connections next to the stage room). Every attendee has
@@ -78,7 +79,7 @@ export function useAudienceRooms(
             await turnOn();
           } catch (e) {
             // Device problems (missing, blocked) are not connection failures: report others only.
-            if (!isMediaDeviceError(e)) onErrorRef.current(e);
+            if (!isMediaDeviceError(e) && !isPublishPermissionError(e)) onErrorRef.current(e);
           }
         };
         await enable(m?.audioEnabled, () => r.localParticipant.setMicrophoneEnabled(true));

@@ -12,6 +12,7 @@ import com.example.meetplatform.common.scheduling.JobLock;
 import com.example.meetplatform.common.security.CurrentUser;
 import com.example.meetplatform.common.security.RateLimiter;
 import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.event.MeetingEvents;
 import com.example.meetplatform.meeting.repository.MeetingRepository;
 import com.example.meetplatform.meeting.service.MeetingAccessService;
 import com.example.meetplatform.organization.service.OrganizationService;
@@ -20,6 +21,7 @@ import com.example.meetplatform.participant.repository.MeetingParticipantReposit
 import com.example.meetplatform.participant.service.ParticipantAccessService;
 import com.example.meetplatform.room.entity.MeetingRoom;
 import com.example.meetplatform.room.service.RoomSessionService;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -51,6 +53,8 @@ public class SpeakerStatsService {
 
     /** Per participant and batch (a batch covers about 10 seconds). */
     static final long MAX_MS_PER_BATCH = 30_000;
+    /** One uninterrupted speaking turn this long counts as someone having spoken (starts automatic recording). */
+    static final long SPEECH_DETECTED_MS = 1000;
     static final long MAX_TURNS_PER_BATCH = 100;
 
     private final SpeakerStatsRepository stats;
@@ -65,12 +69,15 @@ public class SpeakerStatsService {
     private final TransactionTemplate tx;
     private final AppProperties properties;
     private final Clock clock;
+    private final ApplicationEventPublisher events;
 
     public SpeakerStatsService(SpeakerStatsRepository stats, MeetingRepository meetings,
                                MeetingParticipantRepository participants, ParticipantAccessService participantAccess,
                                MeetingAccessService meetingAccess, OrganizationService organizations,
                                RoomSessionService roomSessions, RateLimiter rateLimiter, JobLock jobLock,
-                               TransactionTemplate tx, AppProperties properties, Clock clock) {
+                               TransactionTemplate tx, AppProperties properties, Clock clock,
+                               ApplicationEventPublisher events) {
+        this.events = events;
         this.stats = stats;
         this.meetings = meetings;
         this.participants = participants;
@@ -118,15 +125,22 @@ public class SpeakerStatsService {
         // Repeated entries for one participant are merged, and the batch limits apply to the merged total.
         Map<UUID, long[]> merged = new LinkedHashMap<>();
         for (Entry e : report.entries()) {
-            long[] t = merged.computeIfAbsent(e.participantId(), k -> new long[2]);
+            long[] t = merged.computeIfAbsent(e.participantId(), k -> new long[3]);
             t[0] += e.speakingMs();
             t[1] += e.turns();
+            t[2] = Math.max(t[2], e.longestTurnMs() == null ? 0 : e.longestTurnMs());
         }
         merged.forEach((participantId, t) -> {
             long ms = Math.min(t[0], MAX_MS_PER_BATCH);
             int turns = (int) Math.min(t[1], MAX_TURNS_PER_BATCH);
             if (inSession.contains(participantId) && (ms > 0 || turns > 0)) {
                 stats.add(room.getId(), participantId, meetingId, ms, turns, now);
+                // A backstop for automatic recording (browsers that cannot record speaking clips): one uninterrupted
+                // turn of real length counts as speech. Not the batch total: several coughs or clicks, each briefly
+                // taken for speech, must not add up to it.
+                if (t[2] >= SPEECH_DETECTED_MS) {
+                    events.publishEvent(new MeetingEvents.SpeechDetected(meetingId, participantId));
+                }
             }
         });
         return true;

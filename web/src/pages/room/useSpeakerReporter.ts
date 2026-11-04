@@ -14,50 +14,66 @@ export interface SpeakerEntry {
   participantId: string;
   speakingMs: number;
   turns: number;
+  /** The longest single uninterrupted turn in this batch; a turn still going counts from its start. */
+  longestTurnMs: number;
 }
+
+/** The server accepts a turn of at most an hour. */
+const MAX_TURN_MS = 3_600_000;
 
 /**
  * Speaking time from the SFU's active-speaker updates: who started speaking when, and for how long. `update` is
  * called with everyone speaking now; `drain` returns what accumulated since the last drain (ongoing speech included,
  * up to `now`) and starts over. Only our own participants count (identities are participant ids; the recorder and
- * other service participants are skipped).
+ * other service participants are skipped). Each entry also has the longest single turn, so that a few coughs or
+ * clicks briefly taken for speech are not mistaken for someone talking.
  */
 export class SpeakingTally {
   private readonly since = new Map<string, number>();
-  private readonly totals = new Map<string, { ms: number; turns: number }>();
+  /** When each ongoing turn began (not reset by `drain`, unlike `since`). */
+  private readonly turnStart = new Map<string, number>();
+  private readonly totals = new Map<string, { ms: number; turns: number; longest: number }>();
 
   update(activeIdentities: string[], now: number): void {
     const active = new Set(activeIdentities.filter((id) => UUID.test(id)));
     for (const [id, start] of this.since) {
       if (!active.has(id)) {
-        this.add(id, now - start, 0);
+        this.add(id, now - start, 0, now - (this.turnStart.get(id) ?? start));
         this.since.delete(id);
+        this.turnStart.delete(id);
       }
     }
     for (const id of active) {
       if (!this.since.has(id)) {
         this.since.set(id, now);
-        this.add(id, 0, 1);
+        this.turnStart.set(id, now);
+        this.add(id, 0, 1, 0);
       }
     }
   }
 
   drain(now: number): SpeakerEntry[] {
     for (const [id, start] of this.since) {
-      this.add(id, now - start, 0);
+      this.add(id, now - start, 0, now - (this.turnStart.get(id) ?? start));
       this.since.set(id, now);
     }
     const entries = [...this.totals.entries()]
-      .map(([participantId, t]) => ({ participantId, speakingMs: Math.min(MAX_ENTRY_MS, Math.max(0, Math.round(t.ms))), turns: Math.min(100, t.turns) }))
+      .map(([participantId, t]) => ({
+        participantId,
+        speakingMs: Math.min(MAX_ENTRY_MS, Math.max(0, Math.round(t.ms))),
+        turns: Math.min(100, t.turns),
+        longestTurnMs: Math.min(MAX_TURN_MS, Math.max(0, Math.round(t.longest))),
+      }))
       .filter((e) => e.speakingMs > 0 || e.turns > 0);
     this.totals.clear();
     return entries;
   }
 
-  private add(id: string, ms: number, turns: number) {
-    const t = this.totals.get(id) ?? { ms: 0, turns: 0 };
+  private add(id: string, ms: number, turns: number, turnMs: number) {
+    const t = this.totals.get(id) ?? { ms: 0, turns: 0, longest: 0 };
     t.ms += ms;
     t.turns += turns;
+    t.longest = Math.max(t.longest, turnMs);
     this.totals.set(id, t);
   }
 }

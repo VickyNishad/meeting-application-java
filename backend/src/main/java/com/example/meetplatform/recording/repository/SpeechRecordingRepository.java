@@ -38,25 +38,45 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
 
     // Filter values, per viewer: meetings the user hosts ("hosted") or clips of the user's own participations ("mine").
 
-    @Query("select distinct r.meetingId, r.meetingTitle from SpeechRecording r where r.hostId = :user")
+    // The filter follows Date -> Meeting -> Participant, so meetings and participants come with the folder dates
+    // (DD-MM-YYYY, the first segment of the storage path: the clip's start in the meeting's time zone) they have clips on.
+
+    /** Meetings with clips: id, title, folder date, and the latest clip under that title (to pick a renamed meeting's title). */
+    @Query("""
+            select r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10), max(r.startTime)
+            from SpeechRecording r where r.hostId = :user
+            group by r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10)
+            """)
     List<Object[]> hostedMeetings(UUID user);
 
     /**
      * Participants with clips, each with the meeting it belongs to: participantId is a meeting_participants row,
-     * i.e. one person's participation in one meeting. Lets the participant filter follow the meeting filter.
+     * i.e. one person's participation in one meeting. Also the folder date, and whether the participant is the
+     * meeting's host (their account is the meeting's host_id, recorded on the clip; guests have no account).
      */
-    @Query("select distinct r.participantId, r.participantName, r.meetingId from SpeechRecording r where r.hostId = :user")
+    @Query("""
+            select distinct r.participantId, r.participantName, r.meetingId, substring(r.storagePath, 1, 10),
+                   case when r.participantUserId = r.hostId then true else false end
+            from SpeechRecording r where r.hostId = :user
+            """)
     List<Object[]> hostedParticipants(UUID user);
 
     /** The folder date (DD-MM-YYYY, the first segment of the storage path). */
     @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.hostId = :user")
     List<String> hostedDates(UUID user);
 
-    @Query("select distinct r.meetingId, r.meetingTitle from SpeechRecording r where r.participantUserId = :user")
+    @Query("""
+            select r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10), max(r.startTime)
+            from SpeechRecording r where r.participantUserId = :user
+            group by r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10)
+            """)
     List<Object[]> ownMeetings(UUID user);
 
-    @Query("select distinct r.participantId, r.participantName, r.meetingId from SpeechRecording r "
-            + "where r.participantUserId = :user")
+    @Query("""
+            select distinct r.participantId, r.participantName, r.meetingId, substring(r.storagePath, 1, 10),
+                   case when r.participantUserId = r.hostId then true else false end
+            from SpeechRecording r where r.participantUserId = :user
+            """)
     List<Object[]> ownParticipants(UUID user);
 
     @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.participantUserId = :user")

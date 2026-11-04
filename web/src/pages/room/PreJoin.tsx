@@ -4,6 +4,8 @@ import { AlertTriangle, Mic, MicOff, Video, VideoOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Alert, Label, NativeSelect, Switch } from '@/components/ui/primitives';
 import type { DevicePrefs } from '@/lib/joinStore';
+import { isNoiseFilterSupported } from '@/lib/audio/noiseFilter';
+import { useNoiseReduction } from '@/lib/audio/noiseReductionPref';
 import { cn } from '@/lib/utils';
 
 function mediaErrorMessage(e: unknown, what: string): string {
@@ -94,6 +96,7 @@ export function PreJoin({
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
   const [speakers, setSpeakers] = useState<MediaDeviceInfo[]>([]);
   const level = useMicLevel(audioTrack);
+  const [noiseReduction, setNoiseReduction] = useNoiseReduction();
   // Latest prefs/onChange for the async device callbacks below.
   const latest = useRef({ value, onChange });
   useEffect(() => {
@@ -300,6 +303,15 @@ export function PreJoin({
               <p className="text-xs text-muted-foreground">Saves bandwidth; you won't publish video.</p>
             </div>
             <Switch id="pj-audio-only" checked={!value.videoEnabled} onCheckedChange={(c) => set({ videoEnabled: !c })} />
+          </div>
+        )}
+        {isNoiseFilterSupported() && (
+          <div className="flex items-center justify-between gap-3 rounded-lg border p-3 sm:col-span-2">
+            <div>
+              <Label htmlFor="pj-noise">Noise reduction</Label>
+              <p className="text-xs text-muted-foreground">Reduces background noise such as fans, typing and traffic.</p>
+            </div>
+            <Switch id="pj-noise" checked={noiseReduction} onCheckedChange={setNoiseReduction} />
           </div>
         )}
       </div>

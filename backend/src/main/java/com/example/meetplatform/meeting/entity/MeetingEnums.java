@@ -18,6 +18,12 @@ public final class MeetingEnums {
 
     public enum ScreenSharePolicy { EVERYONE, HOSTS_ONLY }
 
+    /** The three media the host controls, each with its own permission. */
+    public enum MediaKind { MICROPHONE, CAMERA, SCREEN_SHARE }
+
+    /** A meeting-wide media permission or a participant's override (ALLOWED / RESTRICTED). */
+    public enum MediaPermission { ALLOWED, RESTRICTED }
+
     /**
      * EVERYONE_VISIBLE: all participants see and hear each other. HOST_AND_SELF_ONLY: attendees see and hear only the
      * host, co-hosts and themselves; the host and co-hosts see everyone (enforced by the SFU with two rooms per

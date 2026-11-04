@@ -5,9 +5,7 @@ import com.example.meetplatform.common.audit.AuditService;
 import com.example.meetplatform.common.config.AppProperties;
 import com.example.meetplatform.common.exception.ApiException;
 import com.example.meetplatform.common.persistence.AfterCommit;
-import com.example.meetplatform.media.dto.MediaWebhookEvent;
 import com.example.meetplatform.media.service.MediaService;
-import com.example.meetplatform.media.service.RoomNames;
 import com.example.meetplatform.media.service.RoomSignals;
 import com.example.meetplatform.meeting.entity.Meeting;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MediaMode;
@@ -31,6 +29,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,21 +39,24 @@ import java.util.function.Supplier;
 
 /**
  * Auto-record: when a meeting has {@code autoRecord} on, each session gets one composite recording of the room that
- * follows the active speaker, started when the SFU confirms the first media connection. There are no per-participant
+ * follows the active speaker, started when someone first speaks (see {@link MeetingEvents.SpeechDetected}): a session
+ * in which nobody speaks leaves no recording, not even an empty one. There are no per-participant
  * files (older PARTICIPANT recordings stay readable). In a webinar the composite shows the stage only, because
  * attendees' tracks are not subscribable by anyone but the stage. The host turned this on, and the join page and
  * the room both say the meeting is recorded; the capture is still announced to the room before it starts and does
  * not start if the room cannot be notified.
  *
- * <p>The recording starts after the webhook transaction commits (so the participant is already JOINED) and in its
- * own transaction: egress calls never hold the webhook's transaction, and a slow or missing egress worker cannot
- * fail presence tracking. Later joins find the in-flight recording and return without calling the media server; a
- * partial unique index keeps it to one in-flight room recording when webhooks race.
+ * <p>The recording starts after the transaction that recorded the speech commits, in its own transaction: egress
+ * calls never hold that transaction, and a slow or missing egress worker cannot fail it. Later speech finds the
+ * in-flight recording and returns without calling the media server; a partial unique index keeps it to one in-flight
+ * room recording when speech from several people races.
  */
 @Service
 public class AutoRecordingService {
 
     private static final Logger log = LoggerFactory.getLogger(AutoRecordingService.class);
+    /** How long after a failed automatic start of a room recording before speech tries again. */
+    static final Duration RETRY_AFTER_FAILURE = Duration.ofMinutes(5);
 
     private final MeetingParticipantRepository participants;
     private final MeetingRepository meetings;
@@ -86,25 +88,19 @@ public class AutoRecordingService {
         this.clock = clock;
     }
 
+    /**
+     * Someone spoke: the session's recording starts now if it is not running yet. Joining alone records nothing, so a
+     * session in which nobody speaks leaves no recording.
+     */
     @EventListener
     @Transactional(propagation = Propagation.MANDATORY)
-    public void onMediaEvent(MediaWebhookEvent event) {
-        // Recording is of the stage room; joins of an audience room (HOST_AND_SELF_ONLY) start nothing.
-        if (event.type() != MediaWebhookEvent.Type.PARTICIPANT_JOINED || event.participantIdentity() == null
-                || RoomNames.isAudience(event.roomName())) {
-            return;
-        }
-        UUID participantId;
-        try {
-            participantId = UUID.fromString(event.participantIdentity());
-        } catch (IllegalArgumentException notOurs) {
-            return; // e.g. egress recorder participants
-        }
+    public void onSpeechDetected(MeetingEvents.SpeechDetected event) {
+        UUID participantId = event.participantId();
         AfterCommit.run(() -> {
             try {
                 startFor(participantId);
             } catch (RuntimeException e) {
-                // Never fail the webhook: it is already committed and the provider would not deliver it again.
+                // Never fail what reported the speech (a speaking clip, speaking time): it is already committed.
                 log.warn("Auto-recording for participant {} could not be started: {}", participantId, e.getMessage());
             }
         });
@@ -112,7 +108,7 @@ public class AutoRecordingService {
 
     /**
      * Switched off: stop everything auto-record is capturing (room and participants), announce it, and let later
-     * joiners in unrecorded. Switched on: recordings a moderator had stopped may start again on the next join.
+     * joiners in unrecorded. Switched on: recordings a moderator had stopped may start again on the next speech.
      */
     @EventListener
     @Transactional(propagation = Propagation.MANDATORY)
@@ -154,7 +150,8 @@ public class AutoRecordingService {
     /** What to record, only when the participant really is in the live session of an auto-recorded meeting. */
     private Optional<Target> target(UUID participantId) {
         MeetingParticipant p = participants.findById(participantId).orElse(null);
-        if (p == null || p.getState() != MeetingParticipant.State.JOINED || p.getRoomId() == null) {
+        // Admitted or connected: a speaking clip may be opened just before the SFU's "joined" notice is processed.
+        if (p == null || !p.isPresent() || p.getRoomId() == null) {
             return Optional.empty();
         }
         Meeting meeting = meetings.findById(p.getMeetingId()).orElse(null);
@@ -171,6 +168,12 @@ public class AutoRecordingService {
         tx.executeWithoutResult(s -> {
             if (!recordings.findByRoomIdAndKindAndStatusIn(t.roomId(), Recording.KIND_CLOUD, Recording.IN_FLIGHT)
                     .isEmpty() || recordings.existsByRoomIdAndKindAndAutoSuppressedTrue(t.roomId(), Recording.KIND_CLOUD)) {
+                return;
+            }
+            // Started by speech, which comes often: after a failure (e.g. no recorder available) it is tried again
+            // only after a pause, not once per sentence, so a broken recorder does not leave a failed entry per turn.
+            if (recordings.existsByRoomIdAndKindAndAutoStartedTrueAndStatusAndCreatedAtAfter(t.roomId(),
+                    Recording.KIND_CLOUD, Recording.Status.FAILED, clock.instant().minus(RETRY_AFTER_FAILURE))) {
                 return;
             }
             Recording r = Recording.autoRoom(t.meetingId(), t.roomId(), t.audioOnly(), clock.instant());

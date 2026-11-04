@@ -88,6 +88,10 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         joined(roomName, hostPid);
         joined(roomName, attendeePid);
         joined(roomName, guestPid);
+        // Joining records nothing: the recording starts with the first speech, and only once.
+        verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+        speaks(meetingId, hostJoin, host);
+        speaks(meetingId, guestJoin(meetingId, "Guest Gopal"), null);
 
         verify(media, times(1)).startRoomRecording(eq(roomName), anyString(), eq("speaker"), eq(false));
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
@@ -113,6 +117,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         String roomName = hostJoin.get("roomName").asString();
         String attendeePid = join(meetingId, attendee).get("participantId").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
         joined(roomName, attendeePid);
         complete(roomEgress);
         String room = roomRecordingId(list(meetingId, host));
@@ -142,6 +147,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         String roomName = hostJoin.get("roomName").asString();
         String attendeePid = join(meetingId, attendee).get("participantId").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
         UUID roomId = recordingRepository.findAll().stream()
                 .filter(r -> r.getMeetingId().toString().equals(meetingId)).findFirst().orElseThrow().getRoomId();
         Recording legacy = Recording.autoParticipant(UUID.fromString(meetingId), roomId, UUID.fromString(attendeePid),
@@ -176,6 +182,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
                 .andReturn().getResponse().getContentAsString()).get("id").asString();
         JsonNode hostJoin = join(meetingId, host);
         joined(hostJoin.get("roomName").asString(), hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
 
         JsonNode rec = list(meetingId, host).get(0);
         assertThat(rec.get("stageOnly").asBoolean()).isTrue();
@@ -183,13 +190,16 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    void reconnectWebhookDoesNotStartASecondRecordingForTheSameParticipant() throws Exception {
+    void reconnectsAndFurtherSpeechDoNotStartASecondRecording() throws Exception {
         String meetingId = meeting(true);
         JsonNode hostJoin = join(meetingId, host);
         String roomName = hostJoin.get("roomName").asString();
         String pid = hostJoin.get("participantId").asString();
         joined(roomName, pid);
+        speaks(meetingId, hostJoin, host);
         joined(roomName, pid);
+        speaks(meetingId, hostJoin, host);
+        reportsSpeech(meetingId, pid, pid, 5_000);
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
         verify(media, times(1)).startRoomRecording(eq(roomName), anyString(), anyString(), anyBoolean());
     }
@@ -198,9 +208,51 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
     void nothingIsRecordedWhenAutoRecordIsOff() throws Exception {
         String meetingId = meeting(false);
         JsonNode hostJoin = join(meetingId, host);
-        joined(hostJoin.get("roomName").asString(), hostJoin.get("participantId").asString());
+        String pid = hostJoin.get("participantId").asString();
+        joined(hostJoin.get("roomName").asString(), pid);
+        reportsSpeech(meetingId, pid, pid, 5_000);
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
         verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+    }
+
+    /** A session in which nobody speaks leaves no recording at all, not even an empty or failed entry. */
+    @Test
+    void aSessionInWhichNobodySpeaksLeavesNoRecording() throws Exception {
+        String meetingId = meeting(true);
+        JsonNode hostJoin = join(meetingId, host);
+        String roomName = hostJoin.get("roomName").asString();
+        JsonNode attendeeJoin = join(meetingId, attendee);
+        joined(roomName, hostJoin.get("participantId").asString());
+        joined(roomName, attendeeJoin.get("participantId").asString());
+        joined(roomName, guestJoin(meetingId, "Quiet Guest").get("participantId").asString());
+
+        verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+        verify(media, never()).sendData(eq(roomName), eq("recording"), any(), anyList());
+        assertThat(list(meetingId, host).size()).isZero();
+        assertThat(recordingRepository.findAll().stream().filter(r -> r.getMeetingId().toString().equals(meetingId))).isEmpty();
+    }
+
+    /**
+     * Browsers that cannot record speaking clips still start it through reported speaking time: a second or more of
+     * speech does, a shorter blip does not.
+     */
+    @Test
+    void reportedSpeakingTimeStartsTheRecordingButABlipDoesNot() throws Exception {
+        String meetingId = meeting(true);
+        JsonNode hostJoin = join(meetingId, host);
+        String roomName = hostJoin.get("roomName").asString();
+        String hostPid = hostJoin.get("participantId").asString();
+        String attendeePid = join(meetingId, attendee).get("participantId").asString();
+        joined(roomName, hostPid);
+        joined(roomName, attendeePid);
+
+        reportsSpeech(meetingId, hostPid, attendeePid, 400);
+        verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+        // Coughs or clicks briefly taken for speech: they add up past a second, but no single turn is that long.
+        reportsSpeech(meetingId, hostPid, attendeePid, 2_800, 6, 500);
+        verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+        reportsSpeech(meetingId, hostPid, attendeePid, 1_500);
+        verify(media, times(1)).startRoomRecording(eq(roomName), anyString(), eq("speaker"), eq(false));
     }
 
     @Test
@@ -212,12 +264,18 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
                 .when(media).sendData(eq(roomName), eq("recording"), any(), anyList());
 
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
 
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
         verify(media, never()).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
         JsonNode all = list(meetingId, host);
         assertThat(all.size()).isEqualTo(1);
         all.forEach(r -> assertThat(r.get("status").asString()).isEqualTo("FAILED"));
+
+        // More speech right after the failure does not leave a failed entry per turn.
+        speaks(meetingId, hostJoin, host);
+        speaks(meetingId, hostJoin, host);
+        assertThat(list(meetingId, host).size()).isEqualTo(1);
     }
 
     @Test
@@ -238,6 +296,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         JsonNode hostJoin = join(meetingId, host);
         String roomName = hostJoin.get("roomName").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
 
         mvc.perform(patch("/api/v1/meetings/" + meetingId).header("Authorization", host.bearer())
                         .contentType(MediaType.APPLICATION_JSON).content(toJson(Map.of("autoRecord", false))))
@@ -247,6 +306,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
 
         String attendeePid = join(meetingId, attendee).get("participantId").asString();
         joined(roomName, attendeePid);
+        reportsSpeech(meetingId, hostJoin.get("participantId").asString(), attendeePid, 5_000);
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
         verify(media, times(1)).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
     }
@@ -273,6 +333,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         String roomName = hostJoin.get("roomName").asString();
         String attendeePid = join(meetingId, attendee).get("participantId").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
         joined(roomName, attendeePid);
 
         mvc.perform(post("/api/v1/meetings/" + meetingId + "/recordings/" + roomRecordingId(list(meetingId, host)) + "/stop")
@@ -290,7 +351,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         assertThat(stopped.get(0).hasNonNull("participantId")).isFalse();
     }
 
-    /** AR-03: a moderator's stop holds across joins and reconnects, until auto-record is switched off and on. */
+    /** AR-03: a moderator's stop holds across joins, reconnects and further speech, until auto-record is switched off and on. */
     @Test
     void aModeratorsStopIsNotUndoneByTheNextJoin() throws Exception {
         String meetingId = meeting(true);
@@ -298,6 +359,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         String roomName = hostJoin.get("roomName").asString();
         String attendeePid = join(meetingId, attendee).get("participantId").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
         joined(roomName, attendeePid);
         mvc.perform(post("/api/v1/meetings/" + meetingId + "/recordings/" + roomRecordingId(list(meetingId, host)) + "/stop")
                         .header("Authorization", host.bearer()))
@@ -305,7 +367,10 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         complete(roomEgress);
 
         joined(roomName, attendeePid); // reconnect
-        joined(roomName, guestJoin(meetingId, "Newcomer").get("participantId").asString());
+        JsonNode newcomer = guestJoin(meetingId, "Newcomer");
+        joined(roomName, newcomer.get("participantId").asString());
+        speaks(meetingId, newcomer, null);
+        speaks(meetingId, hostJoin, host);
         verify(media, times(1)).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
 
         for (boolean on : new boolean[] {false, true}) {
@@ -314,6 +379,8 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
                     .andExpect(status().isOk());
         }
         joined(roomName, attendeePid);
+        verify(media, times(1)).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
+        speaks(meetingId, hostJoin, host);
         verify(media, times(2)).startRoomRecording(anyString(), anyString(), anyString(), anyBoolean());
         verify(media, never()).startParticipantRecording(anyString(), anyString(), anyString());
     }
@@ -327,6 +394,7 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
         String coPid = join(meetingId, attendee).get("participantId").asString();
         String guestPid = guestJoin(meetingId, "Guest Ganesh").get("participantId").asString();
         joined(roomName, hostJoin.get("participantId").asString());
+        speaks(meetingId, hostJoin, host);
         joined(roomName, coPid);
         joined(roomName, guestPid);
         mvc.perform(post("/api/v1/meetings/" + meetingId + "/moderation/participants/" + coPid + "/role")
@@ -371,6 +439,34 @@ class AutoRecordingIntegrationTest extends AbstractIntegrationTest {
                         .header("Authorization", user.bearer()))
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
     }
+
+    /**
+     * The participant starts speaking: its browser opens a speaking clip (it does so only once it hears a voice).
+     * {@code user} null: a guest, authenticated with its participant secret.
+     */
+    private void speaks(String meetingId, JsonNode join, SignedIn user) throws Exception {
+        var request = post("/api/v1/meetings/" + meetingId + "/speech-recordings").contentType(MediaType.APPLICATION_JSON)
+                .content(toJson(Map.of("participantId", join.get("participantId").asString(), "format", "audio/webm;codecs=opus")));
+        request = user != null ? request.header("Authorization", user.bearer()) : request.header("X-Participant-Token", join.get("waitToken").asString());
+        mvc.perform(request).andExpect(status().isCreated());
+    }
+
+    /** The reporting moderator's browser reports {@code speakingMs} of speech by {@code speakerPid}. */
+    private void reportsSpeech(String meetingId, String reporterPid, String speakerPid, long speakingMs) throws Exception {
+        reportsSpeech(meetingId, reporterPid, speakerPid, speakingMs, 1, speakingMs);
+    }
+
+    private void reportsSpeech(String meetingId, String reporterPid, String speakerPid, long speakingMs, int turns,
+                               long longestTurnMs) throws Exception {
+        mvc.perform(post("/api/v1/meetings/" + meetingId + "/speaker-stats").header("Authorization", host.bearer())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(toJson(Map.of("participantId", reporterPid, "batchSeq", ++reportSeq,
+                                "entries", List.of(Map.of("participantId", speakerPid, "speakingMs", speakingMs, "turns", turns,
+                                        "longestTurnMs", longestTurnMs))))))
+                .andExpect(status().is2xxSuccessful());
+    }
+
+    private long reportSeq;
 
     private void joined(String roomName, String participantId) throws Exception {
         webhook(new MediaWebhookEvent("EV_" + UUID.randomUUID(), MediaWebhookEvent.Type.PARTICIPANT_JOINED,

@@ -29,6 +29,7 @@ import { JoinFlow, WaitingRoom } from './JoinFlow';
 import { RoomView } from './RoomView';
 import type { EndReason } from './roomContext';
 import { deviceFailureMessage, isMediaDeviceError, type MediaKind } from './mediaErrors';
+import { isPublishPermissionError } from './mediaRights';
 
 function EndScreen({ reason, meetingId, onRejoin }: { reason: EndReason; meetingId: string; onRejoin?: () => void }) {
   const { status } = useAuth();
@@ -253,8 +254,9 @@ export default function MeetingRoomPage() {
   }, []);
 
   const onError = useCallback((e: Error) => {
-    // Device problems are reported (non-fatally) through onMediaDeviceFailure.
-    if (isMediaDeviceError(e)) return;
+    // Device problems are reported (non-fatally) through onMediaDeviceFailure; a device the host has restricted is
+    // simply not published (the control bar shows why).
+    if (isMediaDeviceError(e) || isPublishPermissionError(e)) return;
     if (connectedRef.current) {
       toast.error(`Could not publish your microphone or camera: ${errorMessage(e)}`, { id: 'publish-failure' });
       return;

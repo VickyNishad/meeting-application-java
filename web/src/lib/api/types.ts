@@ -308,6 +308,34 @@ export interface RoomStateView {
   presentCount?: number;
   /** Real names of everyone present: stage of a webinar only (the SFU shows attendees as "Attendee"). */
   participants?: RoomActor[];
+  /** Meeting-wide media permissions for participants (hosts and co-hosts always may publish). */
+  mediaPermissions?: MediaPermissions;
+  /** The viewer's own media rights. */
+  myMedia?: ParticipantMedia;
+  /** Everyone's media rights: the host only. */
+  participantMedia?: ParticipantMedia[];
+}
+
+export type MediaPermission = 'ALLOWED' | 'RESTRICTED';
+/** For one participant: ALLOWED / RESTRICTED override the meeting; DEFAULT follows it again. */
+export type MediaOverride = MediaPermission | 'DEFAULT';
+export type MediaKindKey = 'microphone' | 'camera' | 'screenShare';
+
+export interface MediaPermissions {
+  microphone: MediaPermission;
+  camera: MediaPermission;
+  screenShare: MediaPermission;
+}
+
+/** A participant's overrides (null = follows the meeting) and what it may publish now. */
+export interface ParticipantMedia {
+  participantId: string;
+  microphoneOverride: MediaPermission | null;
+  cameraOverride: MediaPermission | null;
+  screenShareOverride: MediaPermission | null;
+  microphone: boolean;
+  camera: boolean;
+  screenShare: boolean;
 }
 
 export interface SpeakerStat {
@@ -507,11 +535,15 @@ export interface SpeechRecording {
   createdAt: string;
 }
 
+/** Filter values; the filter follows Date -> Meeting -> Participant. Dates are folder dates, YYYY-MM-DD, newest first. */
 export interface SpeechRecordingFacets {
-  meetings: { id: string; label: string }[];
-  /** Participants with clips; each is one participation, in the meeting `meetingId`. */
-  participants: { id: string; label: string; meetingId: string }[];
-  /** Folder dates, YYYY-MM-DD, newest first. */
+  /** Meetings with clips, with the dates they have clips on. */
+  meetings: { id: string; label: string; dates: string[] }[];
+  /**
+   * Participants with clips; each is one participation, in the meeting `meetingId`, with the dates it has clips on.
+   * `host`: the meeting's host. `label` is the plain name.
+   */
+  participants: { id: string; label: string; meetingId: string; host: boolean; dates: string[] }[];
   dates: string[];
 }
 

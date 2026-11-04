@@ -104,15 +104,60 @@ export function getStoredParticipant(meetingId: string): StoredParticipant | nul
   return null;
 }
 
+const previousKey = (meetingId: string) => `mp-prev:${meetingId}`;
+const nameKey = (meetingId: string) => `mp-name:${meetingId}`;
+
+/** The name a guest entered to join, kept for this tab (a webinar attendee's own entry shows it). */
+export function rememberGuestName(meetingId: string, name: string): void {
+  try {
+    window.sessionStorage.setItem(nameKey(meetingId), name);
+  } catch {
+    // ignore
+  }
+}
+
+export function getGuestName(meetingId: string): string | undefined {
+  try {
+    return window.sessionStorage.getItem(nameKey(meetingId)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function clearJoin(meetingId: string): void {
+  // Kept so that joining this meeting again from this tab proves the earlier participation (the host's media
+  // restrictions on a guest then still apply).
+  const previous = getStoredParticipant(meetingId);
   memory.delete(meetingId);
   obtainedAt.delete(meetingId);
   mediaMemory.delete(meetingId);
   try {
     window.sessionStorage.removeItem(key(meetingId));
+    if (previous) {
+      window.sessionStorage.setItem(
+        previousKey(meetingId),
+        JSON.stringify({ participantId: previous.participantId, waitToken: previous.waitToken }),
+      );
+    }
   } catch {
     // ignore
   }
+}
+
+/** The participation this tab last had in the meeting (current or cleared), to present when joining it again. */
+export function getRejoinCredentials(meetingId: string): { participantId: string; token: string } | undefined {
+  const current = getStoredParticipant(meetingId);
+  if (current) return { participantId: current.participantId, token: current.waitToken };
+  try {
+    const raw = window.sessionStorage.getItem(previousKey(meetingId));
+    const p = raw ? (JSON.parse(raw) as Partial<StoredParticipant>) : null;
+    if (p && typeof p.participantId === 'string' && typeof p.waitToken === 'string') {
+      return { participantId: p.participantId, token: p.waitToken };
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
 }
 
 /** Records the user's mic/camera choice for this meeting (pre-join choice, in-meeting toggles, device failures). */

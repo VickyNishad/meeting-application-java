@@ -1,0 +1,130 @@
+RECORDING: DO NOT STORE A RECORDING WHEN NOBODY SPEAKS
+Report
+Date: 2026-11-04
+Status: implemented (approved "A+B"), tested, deployed locally. The independent QA review found the issues in
+section 7; NONE of them is fixed yet, pending the owner's approval. Nothing is committed.
+
+==========================================================================================
+1. PROBLEM AND ROOT CAUSE
+==========================================================================================
+"If my meeting starts and nobody speaks, why is an empty recording stored?"
+- Automatic cloud recording (meetings with "Record automatically") started the moment the first person joined
+  and recorded the whole session whether or not anyone spoke. In this database, 80 of 81 cloud recordings were
+  automatic, 12 of them in meetings where nobody ever spoke. All 81 are FAILED because of a separate, older
+  recorder fault ("Start signal not received"), so each one is an empty row in the recordings list.
+- Speaking clips start only when LiveKit's speaking detection reacts, but that also reacts to coughs, clicks
+  and noise: 75 of 340 clips were shorter than 2 s.
+
+==========================================================================================
+2. WHAT CHANGED
+==========================================================================================
+A) Automatic cloud recording starts on the first real speech, not on the first join.
+   - New event MeetingEvents.SpeechDetected(meetingId, participantId), published when
+     * a speaking clip is opened on the server (the browser opens one only after it heard a voice, see B), or
+     * the moderator's speaking-time report has >= 1000 ms for a participant (backup for browsers that cannot
+       record clips).
+   - AutoRecordingService listens to it (instead of the "participant joined" webhook) and starts the session's
+     recording after commit, once per session (in-flight recordings and a moderator's stop are respected as
+     before). Admitted or connected participants count.
+   - Added during testing: after a failed automatic start, speech does not retry it for 5 minutes
+     (RETRY_AFTER_FAILURE); otherwise a broken recorder left one FAILED row per sentence.
+   - Recordings a host starts manually are unchanged (start at once).
+B) Speaking clips are stored only if they contain a voice.
+   - web/src/pages/room/voiceGate.ts (new): measures the microphone level every 50 ms (AnalyserNode, RMS);
+     a voice is confirmed after >= 300 ms in total at speech level (RMS >= 0.015, about -36 dBFS).
+   - useSpeechRecorder.ts: a clip records from the first moment (nothing is lost) but asks the server for the
+     clip only once the voice is confirmed; a turn that ends without one is dropped in the browser and never
+     reaches the server. If the browser's audio engine is not running, every clip counts as voice (fail-safe).
+
+Files
+  backend: meeting/event/MeetingEvents.java, recording/service/AutoRecordingService.java,
+           recording/service/SpeechRecordingService.java, recording/repository/RecordingRepository.java,
+           analytics/service/SpeakerStatsService.java
+  web:     pages/room/voiceGate.ts (new), pages/room/useSpeechRecorder.ts
+  tests:   recording/AutoRecordingIntegrationTest.java (updated to "starts on speech"; 3 new tests),
+           pages/room/voiceGate.test.ts (new), pages/room/useSpeechRecorder.test.ts (2 new tests)
+No database migration. No API change (the existing endpoints publish the new event).
+
+==========================================================================================
+3. TESTS AND ACTUAL RESULTS
+==========================================================================================
+- Backend ./mvnw verify: 204 run, 0 failures, 1 skipped. AutoRecordingIntegrationTest 15/15, including
+  "a session in which nobody speaks leaves no recording", "reported speaking time starts the recording but a
+  blip does not", and "more speech right after a failure does not leave a failed entry per turn".
+- Web: 244/244, ESLint 0 warnings (voice level, drop a silent turn, keep a spoken turn with its first chunks).
+- Live test with real browsers and LiveKit (fake microphones playing audio files):
+    silent meeting:        no cloud row, no clips                       PASS
+    background noise only: no clips, no cloud row                       PASS
+    one guest speaks:      that guest's clips kept, cloud started once,
+                           no clip of the silent host                   PASS     (7/7)
+- Regression: 41-check live meeting test 41/41.
+Note: the first live run used a file named quiet.wav that turned out to contain speech; a truly silent file
+was generated for the test.
+
+==========================================================================================
+4. INDEPENDENT QA - VERIFIED OK
+==========================================================================================
+Silent meeting; noise only (with and without noise reduction, also a loud generated fan); speech (clips
+kept, exactly one automatic row, first words not lost: recording runs from the start of the turn); speech
+mixed with noise; muted microphone; manual cloud recording still immediate; auto-record off; retry pause
+(one row for 5 minutes of continuous speech after a failure); backup paths (browser without MediaRecorder
+starts it through speaking time; 400 ms and 999 ms reports do not, 1000 ms does); regression 41/41.
+
+==========================================================================================
+5. KNOWN LIMITS
+==========================================================================================
+- Cloud recordings still end FAILED in this environment: the recorder service fault is older and separate.
+- Not tested: Safari/Firefox, and a browser whose audio engine stays suspended (then every clip is kept).
+- The 81 existing FAILED automatic rows were not touched (cleanup option C was not approved).
+
+==========================================================================================
+6. (reserved)
+==========================================================================================
+
+==========================================================================================
+7. INDEPENDENT QA FINDINGS (NOT FIXED - awaiting approval)
+==========================================================================================
+F1 MEDIUM  The speaking-time backup can still start the cloud recording on noise: the 1000 ms threshold is
+           applied to the total of a report (about 10 s), so several short noises that LiveKit briefly
+           marks as speaking add up, even though the browser dropped every one of those clips. Repro: a
+           200 ms burst every 3 s; 2 of 3 such meetings started a recording with 0 clips.
+           Suggested fix: use the backup only for participants whose browser cannot record clips, or
+           require one turn of >= 1000 ms instead of the sum.
+F2 LOW     A clip's start time and duration are about 300 ms off: the server dates the clip when it is
+           requested (after the voice was confirmed), but the recording began at the start of the turn
+           (e.g. 5.57 s of media stored as 5257 ms). Suggested fix: the browser sends when recording began.
+Cosmetic, pre-existing: the host's last speaking-time report after the meeting ends gets a 403.
+
+==========================================================================================
+8. ROUND 2 (2026-11-04, "fix both"): F1 AND F2 FIXED
+==========================================================================================
+F1  Speaking-time reports now carry each participant's longest single uninterrupted turn (longestTurnMs; a
+    turn still going counts from its start, also across reports). The backup trigger fires only for one turn
+    of >= 1000 ms, no longer for the total of a report. A report without the field never triggers it.
+    Files: analytics/dto/SpeakerStatsDtos.java, analytics/service/SpeakerStatsService.java,
+           web pages/room/useSpeakerReporter.ts, lib/api/endpoints.ts
+F2  The browser sends recordingStartedMsAgo (time since the turn began recording) when it asks for a clip; the
+    server dates the clip from it, at most 10 s back; negative values are rejected (400).
+    Files: recording/dto/SpeechRecordingDtos.java, recording/service/SpeechRecordingService.java,
+           web pages/room/useSpeechRecorder.ts, lib/api/endpoints.ts
+
+Tests (actual)
+  Backend verify: 205 run, 0 failures, 1 skipped (new: bursts adding up past 1 s do not start a recording;
+  a clip is dated from when recording began, within bounds).
+  Web: 246/246, ESLint 0 warnings (new: longest-turn tally, clip start offset; 4 existing tests got the new
+  field in their expected values). Three unrelated tests timed out once under load; 246/246 on two reruns.
+  Live: 9/9 (silent, noise, speech, and noise bursts every 3 s: no clip, no recording). Regression 41/41.
+
+Independent QA re-check: F1 PASS (3 burst meetings: 0 rows, 0 clips; API boundary cases correct; browsers
+without MediaRecorder still start it), F2 PASS (clip start within +16..+33 ms of the real start, duration
+within +24..+53 ms of the media; before: ~300 ms short), regression PASS. No new MEDIUM or higher findings.
+
+Remaining notes (not fixed, for the owner to decide)
+  L1 LOW   The clip start offset also includes the wait for the previous clip to finish (up to 10 s); if that
+           plus the voice check exceeds 10 s, the server cap dates the clip late by the excess. Raising the cap
+           to ~15 s would cover it.
+  I1 INFO  The server does not cross-check longestTurnMs against speakingMs (only moderators report, and they
+           can start a recording manually anyway).
+  I2 INFO  LiveKit keeps "speaking" on ~600 ms after a sound, so a noise of ~400 ms or longer counts as a
+           turn of 1 s for the backup trigger.
+  Older cached browsers (without longestTurnMs) never trigger the backup; they rely on clips.

@@ -1,0 +1,329 @@
+================================================================================
+AUDIO RECORDING QUALITY IMPROVEMENT: BACKGROUND NOISE REDUCTION
+================================================================================
+Date     : 2026-11-03
+Scope    : Option A (approved): RNNoise noise filter on the microphone track.
+Status   : Implemented, tested on the running Docker stack, and reviewed by an
+           independent QA agent.
+           QA finding H1 (the voice was 6 dB quieter with the filter on) was
+           fixed after your approval ("yes fix this") and verified.
+           The other QA findings are reported only, not fixed (section 9).
+Git      : Nothing committed.
+
+
+--------------------------------------------------------------------------------
+1. ROOT CAUSE OF THE BACKGROUND NOISE
+--------------------------------------------------------------------------------
+Measured on the 38 clips that were on disk before this change (D:\MeetingApplication\
+Recordings\02-11-2026):
+
+a) The browser's built-in noise suppression was already on, and it is the only
+   noise processing in the app.
+   - LiveKit's defaults are noiseSuppression, echoCancellation, autoGainControl
+     and voiceIsolation all true. The app also sets noiseSuppression and
+     echoCancellation explicitly.
+   - Chrome's suppression is designed for steady noise and leaves a residual
+     floor of about -45 to -55 dBFS.
+   - It does almost nothing against non-steady noise: keyboard, traffic, other
+     people talking.
+b) The noise was in the voice band.
+   - In noise-only clips, most of the energy was between 300 Hz and 3 kHz:
+     babble, crosstalk, room noise.
+   - Low rumble below 150 Hz was a smaller part.
+c) Noise started clips.
+   - 11 of 38 clips peaked at or below -20 dBFS, i.e. almost no speech.
+   - Background noise or other people's voices triggered the server's speaking
+     detection, so clips were recorded that contain only noise.
+   - The PK_VS_IND clips from three people start at the same seconds, which
+     suggests they were near each other's microphones or speakers.
+d) Automatic gain control raises quiet passages (and the noise in them). There
+   was no peak limiter, and one clip clipped at +0.08 dBFS.
+e) Not the cause: the codec and bitrate. Clips were Opus 48 kHz mono at about
+   128 kbps (audio-only) or VP8 + Opus at about 1 Mbps. A higher bitrate would
+   not remove noise.
+
+
+--------------------------------------------------------------------------------
+2. EXISTING AUDIO ARCHITECTURE (unchanged)
+--------------------------------------------------------------------------------
+- Capture: livekit-client 2.15.5 getUserMedia, with constraints from
+  MeetingRoomPage.tsx (audioCaptureDefaults) merged with LiveKit's defaults.
+  Processing happens in the browser, before anything is recorded or sent.
+- Live meeting: WebRTC to the LiveKit SFU (Opus, about 48 kbps, DTX and RED).
+- Speaking clips: useSpeechRecorder.ts.
+  - Each participant's browser records only its own microphone (plus camera if
+    it is on) with MediaRecorder.
+  - A clip starts and stops when the server reports that participant speaking.
+  - Chunks are uploaded to the backend, which stores them in LOCAL or S3.
+  - Participants already have separate audio.
+- Cloud recordings: LiveKit Egress, which records what the SFU receives.
+- There was no processing after recording.
+
+
+--------------------------------------------------------------------------------
+3. ENHANCEMENT IMPLEMENTED
+--------------------------------------------------------------------------------
+Audio chain on the local microphone, installed as a LiveKit track processor:
+
+  mic -> 80 Hz low-cut (2nd order, mono) -> RNNoise (WASM in an AudioWorklet)
+      -> peak limiter (DynamicsCompressor, -2 dB, ratio 20) -> processed track
+
+- The chain runs in its own 48 kHz AudioContext, which RNNoise requires.
+- The browser's echo cancellation, noise suppression and gain control stay on.
+  RNNoise does not cancel echo.
+- LiveKit's LocalTrack.mediaStreamTrack returns the processed track. So the
+  existing speaking-clip recorder, the live meeting audio, the server's speaking
+  detection and Egress all receive the cleaned audio, without any change to the
+  recorder.
+- Cleaner audio reaches the server's speaking detection, so noise should start
+  fewer clips. Active-speaker detection itself was not changed.
+- Device switch: LiveKit feeds the new microphone into the same chain.
+- Reconnect, rejoin and audience rooms: the filter is attached to every
+  microphone track that is published.
+- Fallbacks. The plain microphone (with the browser's own processing) is used
+  when:
+  - the browser lacks AudioWorklet or WebAssembly (the toggle is then hidden)
+  - the download or start fails
+  - the filter does not start within 8 s. This deadline was added after testing
+    showed that a stuck start would also block microphone switching, because
+    LiveKit holds the track lock while a processor starts.
+  If the browser blocks audio until the user interacts with the page, the filter
+  is applied on the next click or key press.
+- Toggle: "Noise reduction" on the pre-join screen and in the in-meeting
+  microphone menu. It is on by default and remembered in localStorage.
+- Dependency: @sapphi-red/web-noise-suppressor 0.4.1 (MIT).
+  - It is self-hosted; there is no external service.
+  - Each user downloads only one RNNoise build (about 115 kB gzipped), when they
+    join a meeting.
+- Browser security policy (CSP): script-src gains 'wasm-unsafe-eval', which lets
+  WebAssembly run. It does not allow eval().
+- Not changed: recorder, start/stop triggers, video, folder structure, file
+  names, LOCAL/S3 storage, APIs, metadata, backend, meeting lifecycle,
+  bitrate/codec.
+
+
+--------------------------------------------------------------------------------
+4. FILES CHANGED (web/ only)
+--------------------------------------------------------------------------------
+NEW  src/lib/audio/noiseFilter.ts            processor, support check, timeouts
+NEW  src/lib/audio/noiseFilter.test.ts       9 tests
+NEW  src/lib/audio/noiseReductionPref.ts     the on/off preference
+NEW  src/pages/room/useNoiseFilter.ts        attach/remove on the room's mic
+NEW  src/pages/room/useNoiseFilter.test.ts   9 tests
+MOD  src/pages/room/RoomView.tsx             useNoiseFilter for the room and the
+                                             attendee's audience room
+MOD  src/pages/room/ControlBar.tsx           "Noise reduction" in the mic menu
+MOD  src/pages/room/PreJoin.tsx              "Noise reduction" switch
+MOD  src/components/ui/overlays.tsx          DropdownMenuCheckboxItem
+MOD  nginx.conf                              CSP 'wasm-unsafe-eval'
+MOD  package.json, package-lock.json         the dependency
+
+
+--------------------------------------------------------------------------------
+5. BROWSER COMPATIBILITY
+--------------------------------------------------------------------------------
+- Needs AudioWorklet and WebAssembly: Chrome/Edge 66+, Firefox 76+, Safari 14.1+.
+  Older browsers fall back to the plain microphone, with the toggle hidden.
+- Verified in Chromium (Linux) and in Chrome 156 on Windows (worklet start).
+  Firefox and Safari were not tested here.
+- QA L2 (suspected): Firefox may refuse a 48 kHz context on a 44.1 kHz
+  microphone. The fallback then applies, but the toggle still shows "on".
+- voiceIsolation is only used by Safari on macOS. Chrome ignores it.
+- Microphone permission denied or no device: unchanged existing handling.
+- Echo from loudspeakers is handled by the browser's echo cancellation, as
+  before. Headphones remain the best fix.
+
+
+--------------------------------------------------------------------------------
+6. TEST METHOD
+--------------------------------------------------------------------------------
+- Inputs (48 kHz mono WAV):
+  - Clean speech: 4 of your clips with the best signal-to-noise ratio, with
+    3-4 s silent gaps between them.
+  - Mixed with generated noise:
+    - fan: pink noise, -41 dBFS
+    - AC: brown noise plus 50/100 Hz hum, -40 dBFS
+    - keyboard: click bursts
+    - background chatter: other speakers, -38 dBFS
+  - Also: low-volume mic (speech -18 dB plus fan), loud mic (speech +14 dB,
+    clipped), noise only (no speech).
+- End to end:
+  - Chromium with the WAV as its fake microphone joined new auto-recorded
+    meetings on the running Docker stack, with noise reduction off, then on.
+  - The real speaking clips written to D:\MeetingApplication\Recordings were
+    measured with ffmpeg.
+  - Meeting folders: AQH_<scenario>_<off|on|on_fix>.
+  - Chrome's own audio processing was active in both modes, so "before" is the
+    current production behaviour, not raw audio.
+- Proof of the path: a probe logged which track each MediaRecorder records.
+  - With the filter on, every clip recorded "MediaStreamAudioDestinationNode",
+    i.e. the filtered track, including the first clip after joining.
+  - After switching the filter off, clips recorded the raw "Fake Default Audio
+    Input".
+- Offline: the exact same RNNoise worklet code and WASM were run in Node,
+  sample-aligned with the clean speech, to measure speech fidelity frame by
+  frame.
+- Test-harness notes (not product issues):
+  - Playwright's DevTools auto-attach makes AudioWorklet.addModule hang. The
+    browser was therefore driven over raw DevTools.
+  - Headless Chrome on Windows gave silence from the fake WAV microphone, so
+    Chromium in the container was used.
+  - The login rate limit (10 per 15 min) was reset between test runs by deleting
+    only the local Redis "rl:login*" counters. The rate-limit code was not
+    changed.
+
+
+--------------------------------------------------------------------------------
+7. BEFORE / AFTER RESULTS (actual measurements)
+--------------------------------------------------------------------------------
+Columns (all values in dB, from 50 ms windows over all clips of the run):
+- floor = 10th-percentile window level: the pauses and the silent tail of each
+  clip.
+- speech = 90th-percentile window level.
+- contrast = speech - floor.
+
+7.1 Recorded speaking clips, after the H1 fix
+
+  scenario      off: floor / speech / contrast    on: floor / speech / contrast
+  quiet room    -120 / -22.4 / 97.6               -120 / -20.3 / 99.7
+  fan           -61.1 / -22.4 / 38.7              -84.4 / -21.1 / 63.3   (+24.6)
+  loud mic      -61.4 /  -9.4 / 52.0              -85.5 /  -9.3 / 76.2   (+24.2)
+  low-vol mic   -59.2 / -27.9 / 31.3              -84.8 / -27.8 / 57.0   (+25.7)
+
+  Speech level is now the same as with the filter off. Total recorded speech
+  (all clip seconds added up) is also the same:
+  - fan: 20.5 s on vs 20.9 s off
+  - quiet: 21.7 s vs 19.6 s
+  - low: 15.1 s vs 13.6 s
+
+7.2 Scenarios run before the H1 fix
+  In these "on" runs everything was 6 dB too quiet. Contrast does not depend on
+  that offset, so it is still a fair comparison.
+
+  AC hum            contrast 40.1 -> 67.0   (+27 dB)
+  background voices contrast 63.8 -> 75.9   (+12 dB)
+  keyboard          contrast 60.4 -> 62.2   (+2 dB: keyboard is barely reduced)
+  audio + video     contrast 37.4 -> 62.0;  all 14 video clips contain audio
+  10-min recording  59 clips, all through the filter, contrast steady at 61 dB
+
+7.3 RNNoise stage alone (offline, same code/WASM, before browser processing)
+
+  noise in pauses     fan -30.3 dB, AC -32.9 dB, low-vol mic -28.1 dB,
+                      keyboard -3.3 dB, background voices -0.3 dB
+  speech level        within 0.5 to 0.8 dB of the input in every scenario
+  speech frames at -40 dBFS and louder (normal speech)
+                      median change -0.0 to -1.6 dB
+  quietest speech frames (-50..-40 dBFS: breaths, word tails, 20-30 dB below
+  the voice)          softened (median -6 to -17 dB). This is the expected
+                      noise-suppression trade-off; it can slightly soften word
+                      endings in noisy rooms.
+  added delay         about 21 ms in RNNoise. QA measured about 50 ms for the
+                      whole chain: within lip-sync tolerance.
+
+7.4 Required scenarios
+   1 quiet room                  PASS  speech unchanged, nothing added
+   2 fan                         PASS  pauses about 23-30 dB quieter
+   3 AC                          PASS  about 27-33 dB quieter
+   4 keyboard                    LIMITED  only about 2-3 dB reduction
+   5 background conversations    LIMITED  voices are treated as speech
+                                          (expected for RNNoise)
+   6 several people at once      each participant's clip only records their
+                                 own mic, so it is not affected. Not separately
+                                 tested with two live speakers.
+   7 low-volume mic              PASS  level kept, noise about 26 dB lower
+   8 high-volume mic             PASS  level kept; clipping reduced but NOT
+                                 eliminated: 112 clipped samples vs 332 with
+                                 the filter off (see QA L3)
+   9 microphone switch           PASS  switched to "Fake Audio Input 1"
+                                 mid-meeting; later clips still filtered
+  10 refresh / reconnect         PASS  after the reload the pre-join screen
+                                 appears (existing behaviour); after Join the
+                                 filter re-attaches and all clips are filtered;
+                                 the toggle setting is kept
+  11 long recording (10 min)     PASS  59 clips, steady quality
+  12 audio + video               PASS
+  Toggle off mid-meeting         later clips use the raw mic (as intended); see
+                                 QA M2 for the clip in progress.
+  Playability                    198/198 test clips decode without errors.
+  Unit tests / build             web 220/220 tests (18 new); typecheck, lint
+                                 and production build clean. Backend not
+                                 touched.
+
+7.5 Listening files (before = off, after = on)
+  C:\Users\Vicky\AppData\Local\Temp\claude\d--Meeting\e00eddd0-642c-43ef-bf94-ec323ab99d47\scratchpad\audio\listen-pairs\
+  "_6dB-quieter-prefix" files were recorded before the H1 fix. Turn them up 6 dB
+  to compare fairly.
+  Spectrograms (same names as the listening files):
+  C:\Users\Vicky\AppData\Local\Temp\claude\d--Meeting\e00eddd0-642c-43ef-bf94-ec323ab99d47\scratchpad\audio\report\spec_*.png
+
+
+--------------------------------------------------------------------------------
+8. NOT VERIFIED (needs a person and real hardware)
+--------------------------------------------------------------------------------
+- How natural the voice sounds can only be judged by listening. Please listen
+  to the pairs above, and try a real meeting with a real fan, AC or keyboard
+  near the microphone.
+- Real microphones (USB, laptop, Bluetooth) and Firefox/Safari were not tested.
+- Two people speaking at the same time in one live meeting was not tested.
+
+
+--------------------------------------------------------------------------------
+9. INDEPENDENT QA FINDINGS (separate QA agent)
+--------------------------------------------------------------------------------
+FIXED after approval
+H1 HIGH  With noise reduction on, every voice was 6 dB quieter.
+         Cause: the mic source delivers 2 identical channels, RNNoise (maxChannels
+         1) cleaned only channel 0, and the mono output averaged it with a
+         silent channel.
+         Fix: the low-cut node is now explicitly mono (channelCount 1,
+         'explicit', 'speakers'), plus a unit test.
+         Verified (section 7.1): on/off speech levels now match within 0-2 dB.
+
+OPEN (reported only, not fixed)
+M1 MEDIUM  If WebAssembly is blocked inside the worklet (e.g. a proxy or CSP
+           without 'wasm-unsafe-eval'), start-up "succeeds" but the mic goes
+           completely silent, with no error. The current nginx CSP is correct.
+           Suggested: compile the WASM on the main thread first and/or check
+           the signal before reporting success, then fall back to the plain mic.
+M2 MEDIUM  Turning noise reduction OFF while speaking ends that speaking clip
+           early (audio-only) or leaves it without audio (with video). An
+           active local recording loses the user's own voice for the rest of
+           that recording, because LiveKit stops the processed track.
+           Suggested: make "off" an internal bypass instead of removing the
+           processor.
+M3 MEDIUM  (suspected) If the filter's AudioContext is suspended or interrupted
+           (iOS/Safari after a call, backgrounding), the processed audio stays
+           silent; there is no recovery. Suggested: watch the state, resume,
+           and otherwise fall back.
+L1 LOW     Leaving the meeting while the filter is still starting can leave one
+           AudioContext running (leak).
+L2 LOW     (suspected) If reconnecting the new mic fails during a device switch,
+           the output is silent and the new mic stays open. Firefox
+           sample-rate mismatch: see section 5.
+L3 LOW     The limiter is not a brick wall. It adds about +1 dB make-up gain,
+           and short peaks can overshoot (clipping is reduced, not
+           eliminated). The code comment overstates it.
+L4 LOW     The toggle still shows "on" when the filter could not start (only a
+           console warning).
+L5 LOW     (suspected) The retry after a tap may need pointerup/touchend on
+           touch devices.
+INFO       About 50 ms added audio latency. Double high-pass (browser + 80 Hz)
+           is about -2.5 dB at 85 Hz on deep voices. The setting is not synced
+           across tabs. The pre-join level meter shows the raw mic.
+QA confirmed OK: LiveKit wiring, device switch, mute, reconnect/republish,
+audience rooms, normal leave cleans up, timeouts and toggle serialisation,
+unsupported browsers, CSP and asset MIME types, UI consistency and
+accessibility.
+
+
+--------------------------------------------------------------------------------
+10. REMAINING LIMITATIONS
+--------------------------------------------------------------------------------
+- RNNoise reduces steady noise very strongly. It barely reduces keyboard clicks
+  and does not separate other people's voices from the speaker.
+- In noisy rooms the quietest word endings can be slightly softened.
+- QA findings M1-M3 and L1-L5 are open and awaiting your decision.
+- Test data: test meetings named AQ_*, AQ2_*, AQ3_*, AQP_* and AQH_* and their
+  clips were created on the local stack and can be deleted.
+- Nothing is committed.
+================================================================================

@@ -139,6 +139,29 @@ class SpeechRecordingIntegrationTest extends AbstractIntegrationTest {
         assertThat(names).hasSize(clips.size());
     }
 
+    /**
+     * The browser asks for a clip only once it heard a voice, but records from the start of the turn: the clip is dated
+     * from that start (at most 10 s back), so its start time and duration match the media.
+     */
+    @Test
+    void aClipIsDatedFromWhenTheBrowserBeganRecordingItWithinBounds() throws Exception {
+        String m = meeting("Backdated", true);
+        joinAsHost(m);
+        Who g = joinAsGuest(m, "Guest Early");
+        for (long[] c : new long[][] {{2_000, 2_000}, {60_000, 10_000}}) {
+            Instant before = Instant.now();
+            JsonNode clip = json.readTree(mvc.perform(g.auth(post("/api/v1/meetings/" + m + "/speech-recordings"))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(toJson(Map.of("participantId", g.pid(), "format", "audio/webm", "recordingStartedMsAgo", c[0]))))
+                    .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString());
+            Instant start = Instant.parse(clip.get("startTime").asString());
+            assertThat(Duration.between(start, before).toMillis()).isBetween(c[1] - 1_000, c[1] + 100);
+        }
+        mvc.perform(g.auth(post("/api/v1/meetings/" + m + "/speech-recordings")).contentType(MediaType.APPLICATION_JSON)
+                        .content(toJson(Map.of("participantId", g.pid(), "format", "audio/webm", "recordingStartedMsAgo", -5))))
+                .andExpect(status().isBadRequest());
+    }
+
     @Test
     void chunksMustArriveInOrderAndCompletionNeedsAVerifiedFile() throws Exception {
         String m = meeting("Rules", true);

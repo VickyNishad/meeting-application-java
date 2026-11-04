@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { JoinResponse, Meeting } from './api/types';
-import { clearJoin, getDevicePrefs, getMediaState, getStoredParticipant, saveJoin, saveMediaState, setDevicePrefs } from './joinStore';
+import { clearJoin, getDevicePrefs, getMediaState, getRejoinCredentials, getStoredParticipant, saveJoin, saveMediaState, setDevicePrefs } from './joinStore';
 
 const join = (overrides: Partial<JoinResponse> = {}): JoinResponse => ({
   status: 'ADMITTED',
@@ -66,5 +66,22 @@ describe('joinStore media state (W-02)', () => {
     clearJoin('m1');
     expect(getStoredParticipant('m1')).toBeNull();
     expect(getMediaState('m1')).toEqual({ audioEnabled: false, videoEnabled: false });
+  });
+});
+
+describe('joinStore rejoin credentials (a guest proving its earlier participation)', () => {
+  beforeEach(() => {
+    clearJoin('m1');
+    window.sessionStorage.clear();
+  });
+
+  it('offers the current participation, and still the last one after clearJoin (same tab only)', () => {
+    expect(getRejoinCredentials('m1')).toBeUndefined();
+    saveJoin('m1', join());
+    expect(getRejoinCredentials('m1')).toEqual({ participantId: 'p1', token: 'w1' });
+    clearJoin('m1');
+    expect(getStoredParticipant('m1')).toBeNull();
+    expect(getRejoinCredentials('m1')).toEqual({ participantId: 'p1', token: 'w1' });
+    expect(window.localStorage.length).toBe(0);
   });
 });

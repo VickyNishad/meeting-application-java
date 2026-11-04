@@ -16,6 +16,10 @@ public interface MeetingParticipantRepository extends JpaRepository<MeetingParti
 
     Optional<MeetingParticipant> findByIdAndMeetingId(UUID id, UUID meetingId);
 
+    /** The meeting of a participation, without loading the participation (to lock the meeting first). */
+    @Query("select p.meetingId from MeetingParticipant p where p.id = :id")
+    Optional<UUID> findMeetingIdById(UUID id);
+
     Optional<MeetingParticipant> findByMeetingIdAndWaitTokenHash(UUID meetingId, String waitTokenHash);
 
     Optional<MeetingParticipant> findFirstByMeetingIdAndUserIdOrderByCreatedAtDesc(UUID meetingId, UUID userId);

@@ -8,11 +8,13 @@ import com.example.meetplatform.media.service.MediaService;
 import com.example.meetplatform.media.service.RoomSequence;
 import com.example.meetplatform.media.service.RoomSignals;
 import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.meeting.repository.MeetingRepository;
 import com.example.meetplatform.meeting.service.MeetingRecordingLookup;
 import com.example.meetplatform.participant.dto.RoomStateDtos.Actor;
 import com.example.meetplatform.participant.dto.RoomStateDtos.AudienceAccessView;
 import com.example.meetplatform.participant.dto.RoomStateDtos.AudienceRoomView;
+import com.example.meetplatform.participant.dto.RoomStateDtos.ParticipantMedia;
 import com.example.meetplatform.participant.dto.RoomStateDtos.RoomStateView;
 import com.example.meetplatform.participant.entity.MeetingParticipant;
 import com.example.meetplatform.participant.repository.MeetingParticipantRepository;
@@ -98,10 +100,15 @@ public class RoomStateService {
                 MeetingParticipant.State.WAITING).size() : null;
         List<Actor> names = stage && meeting.isStageOnly() ? present.stream().map(p -> actor(p, p.getJoinedAt())).toList()
                 : null;
+        // Media rights: everyone sees the meeting-wide permissions and their own; only the host, who changes them,
+        // sees everyone's.
+        List<ParticipantMedia> participantMedia = viewer.getRole() == MeetingRole.HOST
+                ? present.stream().map(p -> policy.participantMedia(meeting, p)).toList() : null;
         return new RoomStateView(all.epoch(), all.seq(), stageSeq, viewer.getId(), viewer.getRole(), meeting.getVisibilityMode(),
                 stageIdentities, meeting.isLocked(), meeting.isChatEnabled(), meeting.getScreenSharePolicy(),
                 meeting.isWaitingRoomEnabled(), recordings.isRecording(meetingId), meeting.isAutoRecord(),
-                localRecorders, hands, waiting, names, audience.visibleCount(meeting, room.getId(), viewer));
+                localRecorders, hands, waiting, names, audience.visibleCount(meeting, room.getId(), viewer),
+                policy.mediaPermissions(meeting), policy.participantMedia(meeting, viewer), participantMedia);
     }
 
     /**

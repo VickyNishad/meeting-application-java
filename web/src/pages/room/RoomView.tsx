@@ -20,7 +20,7 @@ import {
   type TrackReferenceOrPlaceholder,
 } from '@livekit/components-react';
 import { ConnectionQuality, ConnectionState, RoomEvent, Track, type Participant, type Room, type RoomOptions } from 'livekit-client';
-import { AlertTriangle, Circle, Eye, LayoutGrid, Loader2, Lock, Maximize, Minimize, PanelRightClose, Signal, SignalLow, SignalMedium, Users, WifiOff } from 'lucide-react';
+import { AlertTriangle, Circle, Eye, Hand, LayoutGrid, Loader2, Lock, Maximize, Minimize, PanelRightClose, Signal, SignalLow, SignalMedium, Users, WifiOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/primitives';
@@ -29,7 +29,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { moderationApi, roomStateApi } from '@/lib/api/endpoints';
 import type { JoinResponse, Meeting } from '@/lib/api/types';
 import { errorMessage } from '@/lib/api/problem';
-import type { MediaState } from '@/lib/joinStore';
+import { getGuestName, type MediaState } from '@/lib/joinStore';
+import { useAuth } from '@/lib/auth/AuthProvider';
+import { useNoiseReduction } from '@/lib/audio/noiseReductionPref';
 import { cn } from '@/lib/utils';
 import { MeetingRoomContext, useMeetingRoom, type EndReason, type MeetingRoomState } from './roomContext';
 import {
@@ -47,6 +49,8 @@ import { initialRoomState, isOnStage, roomReducer } from './roomState';
 import { AudienceRoomsContext, StageRoomContext, useAudienceRooms } from './useAudienceRoom';
 import { useSpeakerReporter } from './useSpeakerReporter';
 import { useSpeechRecorder } from './useSpeechRecorder';
+import { useNoiseFilter } from './useNoiseFilter';
+import { isPublishPermissionError } from './mediaRights';
 import { useClearSpeakingOnReconnect, useSpeakingIndicator } from './speaking';
 import { ControlBar } from './ControlBar';
 import { ChatPanel } from './ChatPanel';
@@ -141,16 +145,23 @@ function useHeldSpeaker(allowed: (p: Visible) => boolean, extraSpeakers: Partici
  */
 const NamedTile = memo(function NamedTile() {
   const trackRef = useMaybeTrackRefContext();
-  const { names } = useMeetingRoom();
+  const { names, raisedHands } = useMeetingRoom();
   const real = trackRef && trackRef.participant.name === ATTENDEE_NAME ? names[trackRef.participant.identity] : undefined;
-  // A screen share is not a person: it is never framed.
-  const speaking = useSpeakingIndicator(trackRef?.source === Track.Source.ScreenShare ? undefined : trackRef?.participant);
+  // A screen share is not a person: it is never framed and carries no hand.
+  const isShare = trackRef?.source === Track.Source.ScreenShare;
+  const speaking = useSpeakingIndicator(isShare ? undefined : trackRef?.participant);
+  const hand = !isShare && !!trackRef && !!raisedHands[trackRef.participant.identity];
   return (
     <div className="speaking-tile relative h-full w-full" data-speaking={speaking ? 'true' : undefined}>
       <ParticipantTile />
       <span aria-hidden="true" className={cn('speaking-frame', speaking && 'is-speaking')} />
       {real && (
         <span className="pointer-events-none absolute left-2 top-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-xs text-white">{real}</span>
+      )}
+      {hand && (
+        <span className="pointer-events-none absolute right-2 top-2 z-10 flex items-center gap-1 rounded-full bg-warning px-2 py-1 text-xs font-semibold text-black shadow">
+          <Hand className="size-3.5" aria-hidden="true" /> Hand raised
+        </span>
       )}
     </div>
   );
@@ -358,7 +369,13 @@ function UnmuteRequestDialog({ request, onClose }: { request: 'MICROPHONE' | 'CA
       else if (request === 'CAMERA') await localParticipant.setCameraEnabled(true);
       onClose();
     } catch (e) {
-      toast.error(`Could not turn on your ${request === 'CAMERA' ? 'camera' : 'microphone'}: ${errorMessage(e)}`);
+      const what = request === 'CAMERA' ? 'camera' : 'microphone';
+      if (isPublishPermissionError(e)) {
+        toast.warning(`The host has restricted your ${what}.`);
+        onClose();
+        return;
+      }
+      toast.error(`Could not turn on your ${what}: ${errorMessage(e)}`);
     } finally {
       setBusy(false);
     }
@@ -439,9 +456,24 @@ export function RoomView({
 }) {
   const room = useRoomContext();
   const containerRef = useRef<HTMLDivElement>(null);
-  const [state, dispatch] = useReducer(roomReducer, undefined, () => initialRoomState(meeting, join));
+  // A webinar attendee's own name: the media server shows it as "Attendee" and the server sends attendees no names.
+  const { user } = useAuth();
+  const [state, dispatch] = useReducer(roomReducer, undefined, () =>
+    initialRoomState(meeting, join, user?.displayName ?? getGuestName(meeting.id)),
+  );
   const [myLocalRecording, setMyLocalRecording] = useState(false);
   const [panel, setPanel] = useState<SidePanel>(null);
+  // Escape closes the side panel, unless it is closing a menu, popover or dialog (those take the key themselves).
+  useEffect(() => {
+    if (!panel) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      if (document.querySelector('[role="menu"], [role="dialog"], [role="alertdialog"], [data-radix-popper-content-wrapper]')) return;
+      setPanel(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [panel]);
   const [layout, setLayout] = useState<LayoutMode>('grid');
   const [fullscreen, setFullscreen] = useState(false);
   const [unmuteRequest, setUnmuteRequest] = useState<'MICROPHONE' | 'CAMERA' | null>(null);
@@ -561,6 +593,20 @@ export function RoomView({
     onAudienceLost,
   );
   const ownAudienceRoom = isModerator ? null : (audienceRooms[0] ?? null);
+  // Stage of a webinar: attendees are hidden in the stage room and arrive through their audience rooms, so a new
+  // attendee's audience room is the sign to fetch its real name.
+  const missingAttendeeName =
+    stageOnly && isModerator && (audienceAccess.data?.rooms ?? []).some((r) => !knownNames[r.participantId]);
+  useEffect(() => {
+    if (!missingAttendeeName) return;
+    const t = window.setTimeout(() => void refetchSnapshot(), 1000);
+    return () => window.clearTimeout(t);
+  }, [missingAttendeeName, refetchSnapshot]);
+  // Noise reduction on the microphone this user publishes; the meeting, the speaking clips and cloud recordings all
+  // get the cleaned audio.
+  const [noiseReduction] = useNoiseReduction();
+  useNoiseFilter(room, noiseReduction);
+  useNoiseFilter(ownAudienceRoom, noiseReduction);
   // Speaking clips: this participant's own turns, in meetings with automatic recording (everyone was told on joining).
   const onClipError = useCallback(
     (e: unknown) => toast.error(`Your speaking clip could not be saved: ${errorMessage(e)}`, { id: 'speech-clip' }),
@@ -741,6 +787,8 @@ export function RoomView({
       setWaitingRoomEnabled: (waitingRoomEnabled: boolean) => dispatch({ type: 'patch', patch: { waitingRoomEnabled } }),
       setChatEnabled: (chatEnabled: boolean) => dispatch({ type: 'patch', patch: { chatEnabled } }),
       setCloudRecording: (cloudRecording: boolean) => dispatch({ type: 'patch', patch: { cloudRecording } }),
+      setMediaPermissions: (mediaPermissions: MeetingRoomState['mediaPermissions']) => dispatch({ type: 'patch', patch: { mediaPermissions } }),
+      setParticipantMedia: (media: MeetingRoomState['participantMedia'][string]) => dispatch({ type: 'participant-media', media }),
     }),
     [],
   );
@@ -765,6 +813,8 @@ export function RoomView({
       localRecorders: state.localRecorders,
       names: state.names,
       presentCount: state.loaded ? state.presentCount : null,
+      mediaPermissions: state.mediaPermissions,
+      participantMedia: state.participantMedia,
       audienceRooms,
       finish,
       ...setters,
@@ -772,7 +822,8 @@ export function RoomView({
     // Field by field: a buffered or duplicate signal that changes nothing visible must not re-render the room.
     [meeting, join, myRole, isModerator, stageOnly, state.stageIdentities, state.locked, state.screenSharePolicy,
       state.waitingRoomEnabled, state.chatEnabled, state.roleOverrides, state.raisedHands, state.cloudRecording,
-      state.localRecorders, state.names, state.loaded, state.presentCount, audienceRooms, setHand, waitingCount, finish,
+      state.localRecorders, state.names, state.loaded, state.presentCount, state.mediaPermissions, state.participantMedia,
+      audienceRooms, setHand, waitingCount, finish,
       setters],
   );
 
@@ -845,8 +896,12 @@ export function RoomView({
             </div>
           </div>
           {panel && (
+            // Phones: the stage dims behind a bottom sheet; tapping it closes the panel.
+            <div className="absolute inset-0 z-10 bg-black/50 md:hidden" aria-hidden="true" onClick={() => setPanel(null)} />
+          )}
+          {panel && (
             <aside
-              className="absolute inset-0 z-20 flex flex-col bg-neutral-900 sm:static sm:w-80 sm:border-l sm:border-white/10 lg:w-96"
+              className="absolute inset-x-0 bottom-0 top-[12%] z-20 flex flex-col overflow-hidden rounded-t-2xl border-t border-white/10 bg-neutral-900 shadow-2xl [color-scheme:dark] md:static md:my-2 md:mr-2 md:w-[22.5rem] md:shrink-0 md:rounded-2xl md:border lg:w-[25rem]"
               aria-label={panel === 'chat' ? 'Chat' : panel === 'participants' ? 'Participants' : 'Host controls'}
             >
               {panel === 'chat' && <ChatPanel chat={chat} onClose={() => setPanel(null)} />}

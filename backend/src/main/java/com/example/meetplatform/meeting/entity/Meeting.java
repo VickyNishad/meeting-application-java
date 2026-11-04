@@ -5,6 +5,8 @@ import com.example.meetplatform.meeting.entity.MeetingEnums.MediaMode;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingStatus;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingType;
 import com.example.meetplatform.meeting.entity.MeetingEnums.Privacy;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaKind;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.entity.MeetingEnums.ScreenSharePolicy;
 import com.example.meetplatform.meeting.entity.MeetingEnums.VisibilityMode;
 import jakarta.persistence.Column;
@@ -87,6 +89,15 @@ public class Meeting extends AuditedEntity {
     @Enumerated(EnumType.STRING)
     @Column(name = "screen_share_policy", nullable = false, length = 16)
     private ScreenSharePolicy screenSharePolicy = ScreenSharePolicy.EVERYONE;
+
+    /** Microphone and camera for participants (hosts and co-hosts always may); screen sharing: {@link #screenSharePolicy}. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "mic_permission", nullable = false, length = 16)
+    private MediaPermission micPermission = MediaPermission.ALLOWED;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "camera_permission", nullable = false, length = 16)
+    private MediaPermission cameraPermission = MediaPermission.ALLOWED;
 
     @Column(name = "chat_enabled", nullable = false)
     private boolean chatEnabled = true;
@@ -284,6 +295,24 @@ public class Meeting extends AuditedEntity {
 
     public void setScreenSharePolicy(ScreenSharePolicy screenSharePolicy) {
         this.screenSharePolicy = screenSharePolicy;
+    }
+
+    /** The meeting-wide permission for one medium (screen sharing is stored as {@link #screenSharePolicy}). */
+    public MediaPermission getMediaPermission(MediaKind kind) {
+        return switch (kind) {
+            case MICROPHONE -> micPermission;
+            case CAMERA -> cameraPermission;
+            case SCREEN_SHARE -> screenSharePolicy == ScreenSharePolicy.EVERYONE ? MediaPermission.ALLOWED : MediaPermission.RESTRICTED;
+        };
+    }
+
+    public void setMediaPermission(MediaKind kind, MediaPermission permission) {
+        switch (kind) {
+            case MICROPHONE -> micPermission = permission;
+            case CAMERA -> cameraPermission = permission;
+            case SCREEN_SHARE -> screenSharePolicy =
+                    permission == MediaPermission.ALLOWED ? ScreenSharePolicy.EVERYONE : ScreenSharePolicy.HOSTS_ONLY;
+        }
     }
 
     public boolean isChatEnabled() {

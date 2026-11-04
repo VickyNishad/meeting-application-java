@@ -6,7 +6,7 @@ import { Alert, Card, CardContent, Input, Label } from '@/components/ui/primitiv
 import { meetingsApi } from '@/lib/api/endpoints';
 import { ApiError, errorMessage } from '@/lib/api/problem';
 import type { JoinResponse, MediaMode, Meeting } from '@/lib/api/types';
-import { clearJoin, getDevicePrefs, saveJoin, saveMediaState, setDevicePrefs, type DevicePrefs } from '@/lib/joinStore';
+import { clearJoin, getDevicePrefs, getRejoinCredentials, rememberGuestName, saveJoin, saveMediaState, setDevicePrefs, type DevicePrefs } from '@/lib/joinStore';
 import { PreJoin } from './PreJoin';
 import { isTerminalJoinStatusError } from './roomData';
 
@@ -172,8 +172,10 @@ export function JoinFlow({ target, onAdmitted, onCancel }: { target: JoinTarget;
       const res = await meetingsApi.join(target.meetingId, {
         password: password || undefined,
         displayName: displayName.trim() || undefined,
+        rejoin: getRejoinCredentials(target.meetingId),
       });
       setDevicePrefs(prefs);
+      if (target.guest && displayName.trim()) rememberGuestName(target.meetingId, displayName.trim());
       saveJoin(target.meetingId, res);
       // The pre-join choice is what gets published; later in-meeting toggles update it.
       saveMediaState(target.meetingId, { audioEnabled: prefs.audioEnabled, videoEnabled: prefs.videoEnabled && !audioOnly });

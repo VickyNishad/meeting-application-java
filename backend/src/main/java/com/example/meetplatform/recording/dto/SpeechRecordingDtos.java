@@ -1,6 +1,7 @@
 package com.example.meetplatform.recording.dto;
 
 import com.example.meetplatform.recording.entity.SpeechRecording;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -16,8 +17,13 @@ public final class SpeechRecordingDtos {
     }
 
     /** {@code format}: what the browser records, "video/webm" or "audio/webm" (codec parameters are ignored). */
+    /**
+     * {@code recordingStartedMsAgo}: how long before this request the browser began recording the turn (it asks for
+     * the clip only once it heard a voice), so the clip is dated from its real start. Optional; at most 10 s count.
+     */
     public record StartRequest(@NotNull UUID participantId,
-                               @NotNull @Pattern(regexp = "(?i)(video|audio)/webm(;.*)?") String format) {
+                               @NotNull @Pattern(regexp = "(?i)(video|audio)/webm(;.*)?") String format,
+                               @Min(0) @Max(600_000) Long recordingStartedMsAgo) {
     }
 
     /** {@code chunks}: how many chunks the client sent, to detect missing ones. */
@@ -37,14 +43,19 @@ public final class SpeechRecordingDtos {
     }
 
     /** The values the list can be filtered by, within what the viewer may see. */
-    public record Facets(List<Option> meetings, List<ParticipantOption> participants, List<String> dates) {
+    /** Filter values. Dates are YYYY-MM-DD folder dates (newest first); the filter follows Date -> Meeting -> Participant. */
+    public record Facets(List<MeetingOption> meetings, List<ParticipantOption> participants, List<String> dates) {
     }
 
-    public record Option(UUID id, String label) {
+    /** A meeting filter value and the dates it has clips on (the meeting filter follows the date). */
+    public record MeetingOption(UUID id, String label, List<String> dates) {
     }
 
-    /** A participant filter value and the meeting it participated in (the participant filter follows the meeting). */
-    public record ParticipantOption(UUID id, String label, UUID meetingId) {
+    /**
+     * A participant filter value: the meeting it participated in and the dates it has clips on (the participant filter
+     * follows the meeting and the date), and whether it is that meeting's host. The label is the plain name.
+     */
+    public record ParticipantOption(UUID id, String label, UUID meetingId, boolean host, List<String> dates) {
     }
 
     public record AccessUrl(String url, Instant expiresAt) {

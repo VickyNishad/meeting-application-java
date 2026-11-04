@@ -1,5 +1,5 @@
 import type { Participant } from 'livekit-client';
-import type { ChatMessage, MeetingRole, ScreenSharePolicy } from '@/lib/api/types';
+import type { ChatMessage, MediaPermission, MediaPermissions, MeetingRole, ParticipantMedia, ScreenSharePolicy } from '@/lib/api/types';
 import { ApiError } from '@/lib/api/problem';
 
 /** Data-channel contract (docs/04-api-contracts.md §16). */
@@ -25,7 +25,11 @@ export type ModerationPacket =
   | { type: 'room-locked'; locked: boolean }
   | { type: 'role-changed'; participantId: string; role: MeetingRole }
   | { type: 'waiting-room'; count: number }
-  | { type: 'settings'; screenSharePolicy?: ScreenSharePolicy; chatEnabled?: boolean; waitingRoomEnabled?: boolean };
+  | { type: 'settings'; screenSharePolicy?: ScreenSharePolicy; chatEnabled?: boolean; waitingRoomEnabled?: boolean }
+  /** The meeting-wide media permissions changed (everyone). */
+  | ({ type: 'media-permissions' } & MediaPermissions)
+  /** Participants' media rights: the host gets every changed participant's, a participant its own. */
+  | { type: 'participant-media'; participants: ParticipantMedia[] };
 export type RecordingPacket = {
   type: 'recording';
   /** CLOUD = whole room, PARTICIPANT = one person's auto-recording (participantId), LOCAL = someone's browser. */
@@ -84,9 +88,39 @@ export function parseModeration(raw: Record<string, unknown> | null): Moderation
       if (policy === undefined && chat === undefined && waiting === undefined) return null;
       return { type: 'settings', screenSharePolicy: policy, chatEnabled: chat, waitingRoomEnabled: waiting };
     }
+    case 'media-permissions': {
+      const microphone = mediaPermission(raw.microphone);
+      const camera = mediaPermission(raw.camera);
+      const screenShare = mediaPermission(raw.screenShare);
+      return microphone && camera && screenShare ? { type: 'media-permissions', microphone, camera, screenShare } : null;
+    }
+    case 'participant-media': {
+      if (!Array.isArray(raw.participants)) return null;
+      const participants = raw.participants.map(parseParticipantMedia).filter((p): p is ParticipantMedia => p !== null);
+      return { type: 'participant-media', participants };
+    }
     default:
       return null;
   }
+}
+
+function mediaPermission(v: unknown): MediaPermission | null {
+  return v === 'ALLOWED' || v === 'RESTRICTED' ? v : null;
+}
+
+export function parseParticipantMedia(v: unknown): ParticipantMedia | null {
+  const m = v as Record<string, unknown> | null;
+  if (!m || typeof m.participantId !== 'string') return null;
+  if (typeof m.microphone !== 'boolean' || typeof m.camera !== 'boolean' || typeof m.screenShare !== 'boolean') return null;
+  return {
+    participantId: m.participantId,
+    microphoneOverride: mediaPermission(m.microphoneOverride),
+    cameraOverride: mediaPermission(m.cameraOverride),
+    screenShareOverride: mediaPermission(m.screenShareOverride),
+    microphone: m.microphone,
+    camera: m.camera,
+    screenShare: m.screenShare,
+  };
 }
 
 export function parseRecording(raw: Record<string, unknown> | null): RecordingPacket | null {

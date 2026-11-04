@@ -41,6 +41,10 @@ import type {
   SpeechRecordingFacets,
   SpeechRecordingView,
   ScreenSharePolicy,
+  MediaKindKey,
+  MediaOverride,
+  MediaPermissions,
+  ParticipantMedia,
   SessionInfo,
   SignedUrl,
   SlotsResponse,
@@ -115,7 +119,7 @@ export const meetingsApi = {
   update: (id: string, body: UpdateMeetingRequest) => api.patch<Meeting>(`/meetings/${enc(id)}`, body),
   cancel: (id: string, reason?: string) => api.post<void>(`/meetings/${enc(id)}/cancel`, { reason }),
   byCode: (joinCode: string) => api.get<MeetingByCode>(`/meetings/by-code/${enc(joinCode)}`, { auth: 'optional' }),
-  join: (id: string, body: { password?: string; displayName?: string }) =>
+  join: (id: string, body: { password?: string; displayName?: string; rejoin?: { participantId: string; token: string } }) =>
     api.post<JoinResponse>(`/meetings/${enc(id)}/join`, body, { auth: 'optional' }),
   joinStatus: (id: string, participantId: string, waitToken: string) =>
     api.get<JoinResponse>(`/meetings/${enc(id)}/join-status`, {
@@ -166,6 +170,12 @@ export const moderationApi = {
     meetingId: string,
     body: { screenSharePolicy?: ScreenSharePolicy; waitingRoomEnabled?: boolean; chatEnabled?: boolean },
   ) => api.put<Meeting>(`${mod(meetingId)}/settings`, body),
+  /** Meeting-wide media permissions (host only). */
+  mediaPermissions: (meetingId: string, body: Partial<MediaPermissions>) =>
+    api.put<MediaPermissions>(`${mod(meetingId)}/media-permissions`, body),
+  /** One participant's media overrides (host only); DEFAULT removes the override. */
+  participantMedia: (meetingId: string, pid: string, body: Partial<Record<MediaKindKey, MediaOverride>>) =>
+    api.put<ParticipantMedia>(`${mod(meetingId)}/participants/${enc(pid)}/media-permissions`, body),
   audit: (meetingId: string, page = 0, size = 20) =>
     api.get<Page<ModerationAuditEntry>>(`${mod(meetingId)}/audit`, { query: { page, size } }),
 };
@@ -221,7 +231,7 @@ export const roomStateApi = {
 export const speakerStatsApi = {
   report: (
     meetingId: string,
-    body: { participantId: string; batchSeq: number; entries: { participantId: string; speakingMs: number; turns: number }[] },
+    body: { participantId: string; batchSeq: number; entries: { participantId: string; speakingMs: number; turns: number; longestTurnMs?: number }[] },
   ) => api.post<void>(`/meetings/${enc(meetingId)}/speaker-stats`, body),
   forMeeting: (meetingId: string) => api.get<MeetingSpeakerStats>(`/meetings/${enc(meetingId)}/speaker-stats`),
 };
@@ -341,8 +351,9 @@ export const adminApi = {
 
 // ---- Speaking clips (recorded by each participant's own browser) ---------------------------------
 export const speechRecordingsApi = {
-  start: (meetingId: string, participantId: string, format: string, waitToken?: string) =>
-    api.post<SpeechRecording>(`/meetings/${enc(meetingId)}/speech-recordings`, { participantId, format }, {
+  /** {@code recordingStartedMsAgo}: how long before this call the turn began recording (the clip is dated from it). */
+  start: (meetingId: string, participantId: string, format: string, waitToken?: string, recordingStartedMsAgo?: number) =>
+    api.post<SpeechRecording>(`/meetings/${enc(meetingId)}/speech-recordings`, { participantId, format, recordingStartedMsAgo }, {
       auth: 'optional',
       headers: participantHeaders(waitToken),
     }),

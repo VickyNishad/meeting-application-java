@@ -1,0 +1,199 @@
+HOST-CONTROLLED MICROPHONE, VIDEO AND SCREEN-SHARING PERMISSIONS
+Implementation report
+Date: 2026-11-03
+Status: implemented and tested. Independent QA found issues (section 9); NONE of them is fixed yet,
+pending the owner's approval.
+
+==========================================================================================
+1. ROOT CAUSE
+==========================================================================================
+- Microphone: the app had no idea of "not allowed to unmute". Mute and mute-all were one-time
+  commands, so a participant could unmute straight away.
+- Camera: there was no restriction of any kind.
+- Screen sharing: only one meeting-wide policy (EVERYONE / HOSTS_ONLY), no per-person control,
+  and co-hosts could change it.
+- Nothing per participant was stored, so a late joiner or a reconnect could not get the
+  current rights.
+
+==========================================================================================
+2. EXISTING ARCHITECTURE (what the feature builds on)
+==========================================================================================
+- Spring Boot backend issues the LiveKit join token. The token's grant
+  (canPublish / canPublishSources) is what the LiveKit SFU actually enforces.
+- Grants can be changed live with LiveKit UpdateParticipant (already used by moderation).
+  LiveKit removes published tracks whose source is revoked and rejects new tracks whose
+  source is not granted.
+- Server-to-client signals travel on the LiveKit data channel, topic "moderation". Only the
+  server can send on it (participants have canPublishData=false).
+- New clients load a snapshot from GET /api/v1/meetings/{id}/room-state.
+- Webinar meetings (HOST_AND_SELF_ONLY) put each attendee's media in a separate "audience" room.
+- Changes take a lock on the meeting row (resolveModerator), so concurrent changes are serialised.
+
+==========================================================================================
+3. PERMISSION PRECEDENCE RULES
+==========================================================================================
+Checked per medium (microphone, camera, screen sharing), in this order:
+  1. Audio-only meeting: only the microphone can ever be granted.
+  2. Host and co-hosts: always allowed. They are never restricted.
+  3. Screen sharing only: a role that already has the SCREEN_SHARE permission is allowed.
+  4. Participant override (ALLOWED / RESTRICTED), if set, decides.
+  5. Otherwise the meeting setting (ALLOWED / RESTRICTED) decides.
+     For screen sharing the meeting setting IS the existing screenSharePolicy
+     (EVERYONE = ALLOWED, HOSTS_ONLY = RESTRICTED); there is one source of truth.
+- An override of DEFAULT removes the override, so the meeting setting applies again.
+- Only the HOST may change permissions (including screenSharePolicy in the room settings).
+  Co-hosts see the settings read-only.
+- Signed-in users keep their overrides when they join again (also after the 30 s reconnect
+  window). Guests start again from the meeting setting (agreed limitation; see QA F2).
+
+==========================================================================================
+4. FILES CHANGED (this task only)
+==========================================================================================
+Backend (backend/src/main/...)
+  resources/db/migration/V10__media_permissions.sql        NEW  schema change
+  meeting/entity/MeetingEnums.java                          MediaKind, MediaPermission enums
+  meeting/entity/Meeting.java                               mic/camera permission fields,
+                                                            get/setMediaPermission
+  participant/entity/MeetingParticipant.java                three override fields
+  participant/service/ParticipantPolicy.java                mayPublish() rule, grants built from it
+  participant/service/ParticipantLifecycleService.java      grants computed per participant
+  participant/service/JoinService.java                      override carry-over for signed-in users
+  participant/service/RoomStateService.java                 permissions in the room-state snapshot
+  participant/dto/RoomStateDtos.java                        MediaPermissionsView, ParticipantMedia
+  moderation/service/ModerationService.java                 two new operations, host-only check,
+                                                            live grant updates, signals
+  moderation/controller/ModerationController.java           two new endpoints
+  moderation/dto/ModerationDtos.java                        request DTOs, MediaOverride enum
+  common/audit/AuditActions.java                            two audit actions
+Backend tests
+  test/.../moderation/MediaPermissionsIntegrationTest.java  NEW  13 integration tests
+Web (web/src/...)
+  lib/api/types.ts, lib/api/endpoints.ts                    types and API calls
+  pages/room/mediaRights.ts                                 NEW  rights from the SFU grant, notices
+  pages/room/mediaRights.test.tsx                           NEW  4 tests
+  pages/room/roomData.ts                                    parse the two new signals
+  pages/room/roomState.ts, roomState.test.ts                state + 5 new tests
+  pages/room/roomContext.tsx, RoomView.tsx                  context wiring, unmute-request handling
+  pages/room/ControlBar.tsx                                 buttons follow the real SFU grant
+  pages/room/ModerationPanel.tsx                            "Media permissions" section (host only)
+  pages/room/ParticipantsPanel.tsx                          per-person controls, lock badges
+  pages/room/MeetingRoomPage.tsx, useAudienceRoom.ts        a 403 publish error is not fatal
+(Other modified files in the working tree belong to the earlier audio and recording-filter tasks.)
+
+==========================================================================================
+5. API AND WEBSOCKET (DATA CHANNEL) CHANGES
+==========================================================================================
+REST (authenticated host only):
+  PUT /api/v1/meetings/{meetingId}/moderation/media-permissions
+      body {"microphone"?, "camera"?, "screenShare"?}: ALLOWED | RESTRICTED
+      at least one field required. Returns {microphone, camera, screenShare}.
+  PUT /api/v1/meetings/{meetingId}/moderation/participants/{participantId}/media-permissions
+      body fields: ALLOWED | RESTRICTED | DEFAULT.
+      Returns {participantId, microphoneOverride, cameraOverride, screenShareOverride,
+               microphone, camera, screenShare}   (last three = effective rights)
+  Errors: 400 invalid or empty body, 401 not signed in, 403 not the host,
+          404 unknown meeting or participant, 409 target is host/co-host or not present.
+  GET .../room-state now also returns:
+      mediaPermissions (everyone), myMedia (own rights), participantMedia (host only).
+Data channel, topic "moderation" (server-only):
+  {type:"media-permissions", microphone, camera, screenShare}   to everyone, numbered
+  {type:"participant-media", participants:[...]}                to the host, and to the
+                                                                affected participant only
+Audit log: MOD_MEDIA_PERMISSIONS, MOD_PARTICIPANT_MEDIA.
+
+==========================================================================================
+6. DATABASE CHANGES (migration V10, applied on the local stack)
+==========================================================================================
+  meetings:              mic_permission, camera_permission
+                         varchar(16) NOT NULL DEFAULT 'ALLOWED', CHECK (ALLOWED|RESTRICTED)
+  meeting_participants:  mic_override, camera_override, screen_override
+                         varchar(16) NULL, CHECK (ALLOWED|RESTRICTED). NULL = use meeting setting
+Screen sharing reuses the existing meetings.screen_share_policy column. Existing meetings keep
+their behaviour (everything allowed) because of the defaults.
+
+==========================================================================================
+7. SECURITY ENFORCEMENT
+==========================================================================================
+- Enforcement is in the LiveKit SFU, not the browser: the grant in the join token and the
+  live UpdateParticipant call decide which sources a participant may publish. Disabled
+  buttons are only a convenience.
+- Revoking removes tracks that are already live (microphone, camera, screen share).
+- A new token (late join, refresh, reconnect) is built from the current rights.
+- Host-only check on the server for both endpoints and for screenSharePolicy in settings.
+- IDs are checked against the meeting (no access to another meeting's participants).
+- Signals cannot be forged: participants cannot publish data.
+- Changes are serialised by the meeting-row lock.
+
+==========================================================================================
+8. TEST CASES AND ACTUAL RESULTS
+==========================================================================================
+Automated
+  Backend ./mvnw -B verify (Java 21, Testcontainers): 195 tests passed, 0 failed.
+  MediaPermissionsIntegrationTest: 13/13 passed. It covers:
+    - restrict microphone for everyone (revoked on the SFU, not for the host)
+    - the three permissions are independent; screen sharing = screenSharePolicy
+    - override beats meeting setting; DEFAULT returns to it; camera and screen overrides
+    - host-only: participant/co-host 403, guest token/anonymous 401, co-host policy change 403,
+      overrides on host/co-host 409
+    - foreign or random IDs 404; empty body / bad value 400
+    - late joiners and reconnects get current rights in the token
+    - signed-in override carry-over after the window; new guest starts from meeting setting
+    - signal routing (host + target only); concurrent changes all applied
+    - webinar audience room restricted; host leaving -> promoted co-host keeps full rights
+    - audio-only meetings only grant the microphone
+  Web (vitest): 237/237 passed, ESLint 0 warnings, TypeScript build clean
+  (re-run 2026-11-03 after the last text change; web container redeployed, HTTP 200).
+
+Live end-to-end (real browsers, real LiveKit SFU, host + 2 participants): 41/41 PASS
+  - restricting microphone / camera / screen sharing removes the live track on the SFU;
+    the participant's button is disabled and a toast explains why
+  - allowing again lets the participant turn it back on
+  - per-participant overrides and DEFAULT behave as in section 3
+  - host and co-host are never restricted
+  - page refresh gives a restricted token, no error screen
+  - modified client with the browser check removed: the SFU still refused to publish
+  - forged data-channel messages from a participant change nothing
+  - simultaneous changes from the host are all applied
+  - unauthorized API calls get 401/404
+  - speaking-clip recording still completes
+
+==========================================================================================
+9. INDEPENDENT QA FINDINGS (NOT FIXED - awaiting approval)
+==========================================================================================
+F1 HIGH  Race: someone who connects at the moment the host restricts can keep publishing.
+         a) meeting-wide change: about 3 in 90 attempts. The join webhook reads the meeting
+            without the lock while the host update skips not-yet-JOINED participants.
+         b) per-person override: 3 in 52 attempts. The join webhook transaction is lost
+            (version conflict on the participant row), so the person is never marked JOINED
+            and later host changes skip them too.
+F2 HIGH  A guest's individual restriction is lost by simply joining again (refresh creates a
+         new participation with no override). A restricted signed-in user can also rejoin as
+         a guest. (Wider than the agreed "after 30 s" limitation.)
+F3 HIGH/MED  The microphone restriction can be bypassed by publishing audio as the
+         "screen share audio" source, and camera via the "screen share" source, while
+         screen sharing is allowed (the default). Works with the normal client library.
+F4 MEDIUM  Changing screen sharing through the meeting edit form (PATCH /meetings/{id}) while
+         the meeting is live is saved but not enforced or signalled. (Related, pre-existing:
+         switching to audio-only while live.)
+F5 MEDIUM  Webinar attendees get false "host allowed..." toasts on join, and false
+         "host restricted..." toasts and a disabled mic when their audience-room connection
+         drops (UI reads the stage room's grant).
+F6 LOW   Host's lock badges can go stale after promote/demote (no participant-media signal).
+F7 LOW   Numbers are accepted as enum values (e.g. {"microphone": 1} = RESTRICTED).
+F8 SUSPECTED (not reproduced in 50 tries)  SFU updates/signals of two near-simultaneous
+         changes could apply out of order.
+F9 INFO  After the host leaves, nobody can lift restrictions (co-hosts cannot); SFU updates
+         to a participant who is mid-reconnect are dropped (normally repaired on rejoin).
+QA verified OK: all authorization and ID checks, co-host 403s, input validation, room-state
+visibility, old-token reconnects, modified-client attempts, promote/demote on the SFU,
+signed-in carry-over, webinar audience-room enforcement, no regressions in mute-all / chat.
+
+==========================================================================================
+10. REMAINING LIMITATIONS
+==========================================================================================
+- All QA findings in section 9 are open.
+- Guests do not keep individual overrides when they join again (agreed decision 3; see F2).
+- If the host leaves, restrictions cannot be changed until a host returns (F9).
+- Pre-existing, not caused by this task: CLOUD whole-meeting recording fails (egress issue);
+  LiveKit GridLayout "updatePages" console errors when camera tiles disappear.
+- Nothing has been committed to git.

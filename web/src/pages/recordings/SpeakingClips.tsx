@@ -145,23 +145,37 @@ export function SpeakingClips({ className }: { className?: string }) {
     set(e.target.value);
     setPage(0);
   };
-  const pickDate = (d: string) => {
-    setDate(d);
+  // The filter follows Date -> Meeting -> Participant: meetings with clips on the selected date, participants with
+  // clips in the selected meeting on that date (a participant is one participation in one meeting).
+  const allMeetings = facets.data?.meetings;
+  const allParticipants = facets.data?.participants;
+  const meetingOptions = useMemo(() => (date ? allMeetings?.filter((m) => m.dates.includes(date)) : allMeetings) ?? [], [allMeetings, date]);
+  const participantOptions = useMemo(
+    () => allParticipants?.filter((p) => (!meetingId || p.meetingId === meetingId) && (!date || p.dates.includes(date))) ?? [],
+    [allParticipants, meetingId, date],
+  );
+  const meetingTitles = useMemo(() => new Map(allMeetings?.map((m) => [m.id, m.label])), [allMeetings]);
+  /** The name, "(Host)" for the meeting's host, and the meeting while no meeting is chosen (one person, many meetings). */
+  const participantLabel = (p: (typeof participantOptions)[number]) => {
+    const name = p.host ? `${p.label} (Host)` : p.label;
+    const meeting = meetingTitles.get(p.meetingId);
+    return meetingId || !meeting ? name : `${name} · ${meeting}`;
+  };
+  // A selection that no longer has clips under the filters before it would only ever match nothing: clear it.
+  const meetingFits = (m: string, d: string) => !m || !d || !allMeetings || allMeetings.some((x) => x.id === m && x.dates.includes(d));
+  const participantFits = (p: string, m: string, d: string) =>
+    !p || !allParticipants || allParticipants.some((x) => x.id === p && (!m || x.meetingId === m) && (!d || x.dates.includes(d)));
+  const changeDate = (next: string) => {
+    const meeting = meetingFits(meetingId, next) ? meetingId : '';
+    setDate(next);
+    setMeetingId(meeting);
+    if (!participantFits(participantId, meeting, next)) setParticipantId('');
     setPage(0);
   };
-  // The participant filter follows the meeting filter: a participant is one participation in one meeting.
-  const allParticipants = facets.data?.participants;
-  const participantOptions = useMemo(
-    () => (meetingId ? allParticipants?.filter((p) => p.meetingId === meetingId) : allParticipants) ?? [],
-    [allParticipants, meetingId],
-  );
   const changeMeeting = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const next = e.target.value;
     setMeetingId(next);
-    // A selected participant from another meeting would only ever match nothing: clear it.
-    if (participantId && next && !allParticipants?.some((p) => p.id === participantId && p.meetingId === next)) {
-      setParticipantId('');
-    }
+    if (!participantFits(participantId, next, date)) setParticipantId('');
     setPage(0);
   };
 
@@ -202,7 +216,7 @@ export function SpeakingClips({ className }: { className?: string }) {
 
       <div className="mt-4 grid gap-2 sm:grid-cols-3">
         <div className="flex gap-2">
-          <NativeSelect aria-label="Filter by date" value={date} onChange={filter(setDate)} className="min-w-0 flex-1">
+          <NativeSelect aria-label="Filter by date" value={date} onChange={(e) => changeDate(e.target.value)} className="min-w-0 flex-1">
             <option value="">All dates</option>
             {/* A date picked in the calendar that has no clips is still shown as the selection. */}
             {date && !facets.data?.dates.includes(date) && <option value={date}>{dmy(date)} (custom)</option>}
@@ -212,11 +226,22 @@ export function SpeakingClips({ className }: { className?: string }) {
               </option>
             ))}
           </NativeSelect>
-          <DatePickerButton value={date} onChange={pickDate} />
+          <DatePickerButton value={date} onChange={changeDate} />
         </div>
-        <NativeSelect aria-label="Filter by meeting" value={meetingId} onChange={changeMeeting}>
-          <option value="">All meetings</option>
-          {facets.data?.meetings.map((m) => (
+        <NativeSelect
+          aria-label="Filter by meeting"
+          value={meetingId}
+          onChange={changeMeeting}
+          disabled={facets.isPending || (!!date && meetingOptions.length === 0)}
+        >
+          {facets.isPending ? (
+            <option value="">Loading meetings…</option>
+          ) : date && meetingOptions.length === 0 ? (
+            <option value="">No meetings on this date</option>
+          ) : (
+            <option value="">All meetings</option>
+          )}
+          {meetingOptions.map((m) => (
             <option key={m.id} value={m.id}>
               {m.label}
             </option>
@@ -226,18 +251,20 @@ export function SpeakingClips({ className }: { className?: string }) {
           aria-label="Filter by participant"
           value={participantId}
           onChange={filter(setParticipantId)}
-          disabled={facets.isPending || (!!meetingId && participantOptions.length === 0)}
+          disabled={facets.isPending || ((!!meetingId || !!date) && participantOptions.length === 0)}
         >
           {facets.isPending ? (
             <option value="">Loading participants…</option>
-          ) : meetingId && participantOptions.length === 0 ? (
+          ) : participantOptions.length === 0 && meetingId ? (
             <option value="">No participants in this meeting</option>
+          ) : participantOptions.length === 0 && date ? (
+            <option value="">No participants on this date</option>
           ) : (
             <option value="">All participants</option>
           )}
           {participantOptions.map((p) => (
             <option key={p.id} value={p.id}>
-              {p.label}
+              {participantLabel(p)}
             </option>
           ))}
         </NativeSelect>

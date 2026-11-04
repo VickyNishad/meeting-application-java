@@ -1,0 +1,289 @@
+================================================================================
+RECORDING FILTER FIX: DATE -> MEETING -> PARTICIPANT -> RECORDINGS
+================================================================================
+Date     : 2026-11-03
+Page     : Recordings -> "Speaking clips" (web/src/pages/recordings/SpeakingClips.tsx)
+Status   : Implemented as approved, with option (a): the meeting name is shown next
+           to each participant while no meeting is selected.
+           Tested, deployed on the local Docker stack, and reviewed by an
+           independent QA agent.
+           QA findings (section 9) are reported only. None were fixed (awaiting
+           your approval).
+Git      : Nothing committed.
+
+
+--------------------------------------------------------------------------------
+1. ROOT CAUSES
+--------------------------------------------------------------------------------
+a) The Meeting dropdown ignored the date.
+   - GET /api/v1/speech-recordings/facets returned dates, meetings and
+     participants as three unrelated lists. A meeting option had no date.
+   - SpeakingClips.tsx always rendered every meeting, and changing the date
+     never reset the selected meeting.
+   - On the real data, choosing 03-11-2026 still offered all 5 meetings, although
+     only IND VS ZM has clips that day. Date + another meeting silently gave an
+     empty list.
+b) The Participant dropdown ignored the date.
+   - It already followed the meeting (previous fix), but with a date selected
+     and "All meetings" it showed participants from every date.
+   - A participant who had no clips on the new date stayed selected.
+c) Participant options carried no host information, so "(Host)" could not be
+   shown.
+d) Not a cause: time zones. Dates are the clip's folder date (DD-MM-YYYY = clip
+   start in the MEETING's time zone, SpeechClipStorage.relativePath). The list
+   filter matches the same folder prefix, and the web code handles dates as
+   plain YYYY-MM-DD strings (no Date/UTC conversion). The convention was kept.
+
+
+--------------------------------------------------------------------------------
+2. DATABASE RELATIONSHIPS USED (no schema change, nothing invented)
+--------------------------------------------------------------------------------
+speech_recordings.participant_id      -> meeting_participants.id
+                                         (one participation in one meeting)
+speech_recordings.meeting_id          -> meetings.id
+speech_recordings.storage_path        first 10 chars = folder date DD-MM-YYYY
+speech_recordings.host_id             = meetings.host_id, stored on the clip
+                                         when it is created
+speech_recordings.participant_user_id = meeting_participants.user_id
+                                         (null for guests)
+
+Participant options remain clip-based, as approved earlier: people who joined
+but never produced a clip are not offered.
+
+
+--------------------------------------------------------------------------------
+3. HOST IDENTIFICATION
+--------------------------------------------------------------------------------
+host = (speech_recordings.participant_user_id = speech_recordings.host_id)
+
+- This is the same rule the app uses to give the HOST role when someone joins
+  (MeetingAccessService.isHost: meetings.host_id equals the user's id).
+- It is computed per clip, so it is per meeting.
+- Guests (no account) are never host. No names are compared, and no user is
+  hardcoded.
+- Checked on the real data: the rule matches meeting_participants.role = HOST in
+  all 15 meeting/participant pairs. Vicky Nishad is host of all 5 meetings and
+  nobody else is.
+- The API returns the plain name plus host=true/false. The web adds " (Host)"
+  exactly once.
+
+
+--------------------------------------------------------------------------------
+4. FILES CHANGED
+--------------------------------------------------------------------------------
+Backend (backend/src/main/java/com/example/meetplatform/recording/)
+  MOD repository/SpeechRecordingRepository.java
+      - hosted/ownMeetings: (id, title, folder date, latest start), grouped
+      - hosted/ownParticipants: (id, name, meetingId, folder date, host flag)
+  MOD dto/SpeechRecordingDtos.java
+      - Option -> MeetingOption(id, label, dates)
+      - ParticipantOption gains host and dates
+  MOD service/SpeechRecordingService.java
+      - facets(): one option per meeting (latest title if renamed) and per
+        participation, with dates newest first
+Frontend (web/src/)
+  MOD lib/api/types.ts
+  MOD pages/recordings/SpeakingClips.tsx
+Tests
+  MOD backend/src/test/.../recording/SpeechRecordingFacetsIntegrationTest.java
+      (+3 tests)
+  MOD web/src/pages/recordings/SpeakingClips.test.tsx
+      (+8 tests; 5 existing expectations updated for the approved labels and
+      date-based resets)
+
+Not changed:
+- the list endpoint and its query
+- recording lifecycle, start/stop triggers, LOCAL/S3 storage
+- audio enhancement
+- playback/download
+- schema/migrations, other pages
+
+
+--------------------------------------------------------------------------------
+5. API CHANGES (existing endpoint, add-only, backward compatible)
+--------------------------------------------------------------------------------
+GET /api/v1/speech-recordings/facets?view=hosted|mine
+
+  meetings[]:     { id, label, dates: ["YYYY-MM-DD", ...] }
+                  (dates added)
+  participants[]: { id, label, meetingId, host: true|false, dates: [...] }
+                  (host and dates added)
+  dates[]:        unchanged
+
+Nothing removed or renamed, and label is still the plain name. Authorization is
+unchanged: hosted = meetings the user hosts; mine = the user's own clips.
+
+
+--------------------------------------------------------------------------------
+6. FRONTEND CHANGES (SpeakingClips.tsx)
+--------------------------------------------------------------------------------
+- Meeting options: only meetings with clips on the selected date.
+- Participant options: only participations with clips in the selected meeting
+  AND on the selected date.
+- Labels:
+  - "Name (Host)" for the meeting's host.
+  - While no meeting is selected: "Name (Host) · Meeting title" (option a).
+- Changing the date (dropdown or calendar):
+  - clears the meeting if it has no clips that day
+  - clears the participant if they are no longer valid
+  - keeps valid selections
+- Changing the meeting: clears an invalid participant.
+- Clearing a filter (choosing "All dates" or "All meetings"): all options return,
+  and valid selections are kept.
+- Empty states: "No meetings on this date", "No participants on this date",
+  "No participants in this meeting".
+- Loading: "Loading meetings…" / "Loading participants…" (selects disabled).
+- Errors: the existing alert with Retry.
+- Options are filtered locally from one facets response, so there are no extra
+  requests or out-of-order responses.
+
+
+--------------------------------------------------------------------------------
+7. TEST CASES AND ACTUAL RESULTS (executed 2026-11-03)
+--------------------------------------------------------------------------------
+Web (Vitest, API mocked): SpeakingClips.test.tsx 21/21 PASSED
+
+   1 Date A -> only Date A meetings (A,B on 02; B,C on 01)          PASS
+   2 Date B -> only Date B meetings                                 PASS
+   3 Meeting A -> only A's participants                             PASS
+   4 Meeting B -> only B's participants                             PASS
+   5 Host shows as "Vicky (Host)" in A and in B, exactly once       PASS
+   6 Others have plain names, no "Host"                             PASS
+   7 Each meeting marks its own host (also backend test below)      PASS
+   8 Date change clears an invalid meeting + participant; keeps     PASS
+     valid ones; clears only the invalid participant
+   9 Meeting change clears an invalid participant (existing tests)  PASS
+  10 Participant -> list request has date + meeting + participant   PASS
+  11 Clear filters -> all options return, valid selections kept     PASS
+  12 Date without clips -> disabled "No meetings/participants on    PASS
+     this date"; meeting without participants (existing test);
+     loading and error states
+  13 Time-zone boundary (backend test below)                        PASS
+  14 Playback/download unchanged (browser check below)              PASS
+
+  Mutation checks (inside the container; project files untouched):
+    meetings ignore the date            -> 2 of 21 tests FAIL (detected)
+    date change keeps a stale meeting   -> 2 of 21 tests FAIL (detected)
+
+Backend (real PostgreSQL 17, Testcontainers)
+  SpeechRecordingFacetsIntegrationTest 6/6 PASSED (3 new):
+  - host flag comes from the meeting's host account:
+      a guest named exactly like the host -> host=false
+  - each meeting flags its own host:
+      the user is host in their own meeting and not host in another user's
+      meeting ("mine" and the other host's "hosted" view)
+  - dates on meetings and participants:
+      - a meeting on 3 dates; another meeting on 1 date only
+      - a clip at 00:30 Kolkata (2026-11-02T19:00Z) is filed and filtered under
+        2026-11-03, not under its UTC date
+      - list date=03 returns only that clip; date=02 does not include it
+      - date + another meeting returns 0
+      - a renamed meeting appears once, under its latest title
+  SpeechClipStorageTest (existing): the folder date is in the meeting's time
+  zone (2026-10-31T20:00Z Kolkata -> 01-11-2026).
+
+Full suites
+  Backend ./mvnw -B verify: Tests run 183, Failures 0, Errors 0, Skipped 1
+                            BUILD SUCCESS (180 before + 3 new; the skipped test
+                            is the live-LiveKit test, as before)
+  Web: 31 files / 228 tests passed; typecheck, lint, production build OK.
+
+Live check (deployed stack, real browser, test account with 38 meetings over
+02-11 and 03-11):
+  - UI meeting list per date vs the database: IDENTICAL (36 date/title pairs).
+  - Labels: "Smoke Tester (Host) · AQH_fan_on_av".
+  - Meeting selected -> only its participant, only its 5 clips.
+  - Changing the date where the meeting has no clips -> meeting and participant
+    reset.
+  - "All dates" -> 38 meetings again.
+  - Playback: the player loads the clip through the signed URL (readyState 4, no
+    error). QA also checked play (inline) and download (attachment) of the full
+    file.
+
+Real owner data: verified by SQL (I cannot log in as Vicky).
+  02-11-2026: IND VS AUS, IND VS NZ, PK VS IND, SL VS IND
+  03-11-2026: IND VS ZM (Kaju, Sandeep, Vicky Nishad (Host))
+  Vicky is host in each meeting.
+
+
+--------------------------------------------------------------------------------
+8. HOW THE FILTER BEHAVES ON THE REAL DATA (expected view for Vicky)
+--------------------------------------------------------------------------------
+  Date 03-11-2026 -> Meeting: IND VS ZM only
+                  -> Participants: Kaju, Sandeep, Vicky Nishad (Host)
+  Date 02-11-2026 -> Meetings: IND VS AUS, IND VS NZ, PK VS IND, SL VS IND
+  PK VS IND       -> Sandeep, Sandeep, Vicky Nishad (Host), Virat
+                     (two different guest participations named Sandeep: see
+                     QA-3)
+
+
+--------------------------------------------------------------------------------
+9. INDEPENDENT QA FINDINGS (separate QA agent; NOT fixed - awaiting approval)
+--------------------------------------------------------------------------------
+Verdict: the filtering logic is correct.
+- Facets vs list results: 182 live combinations, 0 mismatches.
+- Time zones: folder dates match the meeting's time zone for all 293 clips.
+- Resets, JSON compatibility, playback and download: OK.
+The problems are in the labels.
+
+QA-1 HIGH, CONFIRMED (test case; can happen with real use)
+     A host who leaves and rejoins after the reconnect window (30 s) gets a new
+     participation, so "Vicky Nishad (Host)" can appear twice in one meeting.
+     - Cause: each participation is a separate option (the approved
+       one-participant-per-participation rule).
+     - Needs your decision: merge a person's participations in one meeting into
+       one option (the list filter would then use the person, not the
+       participation), or distinguish them in the label (e.g. the time of their
+       first clip).
+QA-2 MEDIUM, CONFIRMED
+     A guest can name themselves "Vicky Nishad (Host)". host=false is correct,
+     but the label looks exactly like the real host's.
+     - Suggested: strip or reject "(Host)" in guest names at join, or mark
+       guests, e.g. "(Guest)".
+QA-3 MEDIUM, CONFIRMED on real data
+     Identical entries that cannot be told apart.
+     - PK VS IND has two guest participations named "Sandeep" (3 and 6 clips),
+       so "Sandeep" is shown twice.
+     - The test account has 3 meetings titled "AQH_fan_on_reload", shown 3
+       times.
+     - Suggested: add a distinguishing detail (first-clip or meeting time).
+QA-4 LOW, CONFIRMED
+     One storage_path that does not start with "DD-MM-YYYY/" makes the whole
+     facets call fail (HTTP 500).
+     - The app never writes such paths (all 293 rows are valid).
+     - Suggested: skip values that do not parse.
+QA-5 LOW, CONFIRMED
+     If loading the filter options fails and a date is then picked, the selects
+     say "No meetings on this date" although the real reason is the error (the
+     alert with Retry is shown).
+     - Suggested: "Filters unavailable" while in error.
+QA-6 LOW, existed before
+     With filters set and no matches, the empty text still says "Clips are
+     recorded in meetings with automatic recording turned on" instead of
+     "no clips match the filters".
+QA-7 INFO  Facets queries sort and group in memory. About 0.2 s at 200k clips
+           for one host (fine now: 293 rows). A covering index or payload cap
+           could come later.
+QA-8 INFO  Disabled selects explain themselves only through their first
+           option text (no aria-describedby).
+QA-9 INFO, existed before
+           The calendar's latest selectable date uses the browser's time zone;
+           folder dates use the meeting's.
+QA-10 INFO Selections are not re-checked when the options reload. Harmless
+           today, because clips are never deleted.
+QA-11 INFO Same-name participants under "All meetings" have no tie-break sort
+           (order may vary).
+
+
+--------------------------------------------------------------------------------
+10. REMAINING ISSUES
+--------------------------------------------------------------------------------
+- QA-1 to QA-3 affect how participants are labelled and need your decision
+  (QA-1 changes the approved participation rule). QA-4 to QA-11 are low or
+  informational.
+- I could not log in as Vicky. Her expected view (section 8) was verified by
+  SQL; the same code path was verified live with the test account.
+- Test meetings and clips (names starting "AQ") on the local stack can be
+  deleted.
+- Nothing committed.
+================================================================================

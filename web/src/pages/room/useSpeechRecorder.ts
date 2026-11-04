@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { Track, type Participant } from 'livekit-client';
 import { speechRecordingsApi } from '@/lib/api/endpoints';
 import { useSpeakingIndicator } from './speaking';
+import { ALWAYS_HEARD, measureVoice, type VoiceGate } from './voiceGate';
 
 /**
  * A speaking turn ends after this much silence: shorter pauses stay in the same clip, longer ones start a new one.
@@ -18,7 +19,8 @@ const UPLOAD_ATTEMPTS = 3;
 export const PREVIOUS_CLIP_WAIT_MS = 10_000;
 
 export interface ClipApi {
-  start(format: string): Promise<{ id: string }>;
+  /** {@code startedMsAgo}: how long ago this clip began recording (it is asked for only once a voice was heard). */
+  start(format: string, startedMsAgo: number): Promise<{ id: string }>;
   chunk(id: string, seq: number, data: Blob): Promise<unknown>;
   finish(id: string, chunks: number): Promise<unknown>;
 }
@@ -55,6 +57,7 @@ export class ClipSession {
   private finished = false;
   private refused = false;
   private recorderDone = false;
+  private discarded = false;
 
   constructor(
     private readonly api: ClipApi,
@@ -63,6 +66,8 @@ export class ClipSession {
     private readonly onError: (e: unknown) => void,
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     after: Promise<unknown> = Promise.resolve(),
+    /** Whether the clip holds a voice: the server only hears of it once it does; otherwise it is dropped here. */
+    private readonly voice: VoiceGate = ALWAYS_HEARD,
   ) {
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0 && !this.refused) {
@@ -75,24 +80,37 @@ export class ClipSession {
       void this.pump();
     };
     recorder.start(CHUNK_MS);
+    const recordingSince = Date.now();
     let waited: ReturnType<typeof setTimeout> | undefined;
     const previous = Promise.race([
       after.catch(() => undefined),
       new Promise<void>((r) => (waited = setTimeout(r, PREVIOUS_CLIP_WAIT_MS))),
     ]).finally(() => clearTimeout(waited));
-    previous.then(() => this.api.start(format)).then(
-      (clip) => {
-        this.id = clip.id;
-        void this.pump();
-      },
-      (e) => {
+    // Recording runs from the start (nothing of the turn is lost); the server is asked for the clip only once a voice
+    // was heard. A turn that ends without one (a cough, a click, background noise) is dropped and never stored.
+    voice.heard.then((heard) => {
+      if (!heard) {
+        this.discarded = true;
         this.refused = true;
         this.queue = [];
-        this.stop();
+        if (this.recorder.state !== 'inactive') this.recorder.stop();
         this.settle();
-        this.onError(e);
-      },
-    );
+        return;
+      }
+      previous.then(() => this.api.start(format, Math.max(0, Date.now() - recordingSince))).then(
+        (clip) => {
+          this.id = clip.id;
+          void this.pump();
+        },
+        (e) => {
+          this.refused = true;
+          this.queue = [];
+          this.stop();
+          this.settle();
+          this.onError(e);
+        },
+      );
+    });
   }
 
   /** Ends the clip (the recorder flushes its last chunk, then the clip is finished on the server). */
@@ -101,7 +119,14 @@ export class ClipSession {
     this.stopped = true;
     if (this.recorder.state !== 'inactive') this.recorder.stop();
     else this.recorderDone = true;
+    // No voice by now: the clip is dropped (see the constructor).
+    this.voice.end();
     void this.pump();
+  }
+
+  /** Dropped without ever reaching the server: no voice was heard. */
+  get wasDiscarded(): boolean {
+    return this.discarded;
   }
 
   get done(): boolean {
@@ -153,7 +178,9 @@ export class ClipSession {
  * Records this participant's own speaking turns (microphone, plus camera when it is on) while `enabled` (a meeting
  * with automatic recording, where everyone was told before joining). A turn starts when the media server reports
  * this participant speaking and ends after CLIP_RELEASE_MS of silence, a mute, or leaving. Only this participant's own
- * tracks are ever recorded. Note: speech detection lags the voice by a few hundred milliseconds, so the very first
+ * tracks are ever recorded. A turn is stored only if the microphone carried a voice (see voiceGate.ts): a cough, a click
+ * or background noise that the speaking detection reacted to leaves nothing. Note: speech detection lags the voice by a
+ * few hundred milliseconds, so the very first
  * syllable of a turn can be missed.
  */
 export function useSpeechRecorder(opts: {
@@ -170,6 +197,25 @@ export function useSpeechRecorder(opts: {
   onErrorRef.current = opts.onError;
   // The latest clip's `settled`: the next turn's clip waits for it before it is opened on the server.
   const previousClip = useRef<Promise<void>>(Promise.resolve());
+  // One audio engine for measuring this participant's voice level, kept for the whole meeting.
+  const audio = useRef<AudioContext | null>(null);
+  useEffect(
+    () => () => {
+      void audio.current?.close().catch(() => undefined);
+      audio.current = null;
+    },
+    [],
+  );
+  const voiceGateFor = useCallback((track: MediaStreamTrack): VoiceGate => {
+    if (typeof AudioContext === 'undefined') return ALWAYS_HEARD;
+    try {
+      audio.current ??= new AudioContext();
+      if (audio.current.state === 'suspended') void audio.current.resume().catch(() => undefined);
+      return measureVoice(track, audio.current);
+    } catch {
+      return ALWAYS_HEARD;
+    }
+  }, []);
 
   useEffect(() => {
     if (!enabled || !speaking || !participant || typeof MediaRecorder === 'undefined') return;
@@ -186,7 +232,7 @@ export function useSpeechRecorder(opts: {
       const recorder = new MediaRecorder(stream, { mimeType: format });
       session = new ClipSession(
         {
-          start: (f) => speechRecordingsApi.start(meetingId, participantId, f, waitToken),
+          start: (f, ago) => speechRecordingsApi.start(meetingId, participantId, f, waitToken, ago),
           chunk: (id, seq, data) => speechRecordingsApi.chunk(meetingId, id, seq, participantId, data, waitToken),
           finish: (id, chunks) => speechRecordingsApi.finish(meetingId, id, participantId, chunks, waitToken),
         },
@@ -195,6 +241,7 @@ export function useSpeechRecorder(opts: {
         (e) => onErrorRef.current(e),
         undefined,
         previousClip.current,
+        voiceGateFor(micTrack),
       );
       previousClip.current = session.settled;
     } catch (e) {
@@ -203,5 +250,5 @@ export function useSpeechRecorder(opts: {
     }
     // Speech ended (after the release time), recording was switched off, or the participant left: end the clip.
     return () => session.stop();
-  }, [enabled, speaking, participant, meetingId, participantId, waitToken]);
+  }, [enabled, speaking, participant, meetingId, participantId, waitToken, voiceGateFor]);
 }

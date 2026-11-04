@@ -54,6 +54,11 @@ spring:
   mvc:
     problemdetails:
       enabled: true
+  jackson:
+    datatype:
+      enum:
+        # Enums only by name: {"microphone": 1} is invalid, not silently the second constant.
+        fail-on-numbers-for-enums: true
   web:
     error:
       include-message: never

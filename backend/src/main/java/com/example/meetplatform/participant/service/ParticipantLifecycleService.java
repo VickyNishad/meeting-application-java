@@ -62,6 +62,7 @@ public class ParticipantLifecycleService {
     private final Duration hostDropoutGrace;
     private final Duration reconnectWindow;
     private final Clock clock;
+    private final MediaGrantSync grants;
 
     public ParticipantLifecycleService(MeetingRepository meetings, MeetingParticipantRepository participants,
                                        ParticipantAccessService participantAccess,
@@ -71,7 +72,8 @@ public class ParticipantLifecycleService {
                                        TaskScheduler scheduler, PlatformTransactionManager transactions,
                                        @Value("${app.meetings.host-dropout-grace:PT20S}") Duration hostDropoutGrace,
                                        @Value("${app.meetings.reconnect-window:PT30S}") Duration reconnectWindow,
-                                       Clock clock) {
+                                       Clock clock, MediaGrantSync grants) {
+        this.grants = grants;
         this.reconnectWindow = reconnectWindow;
         this.scheduler = scheduler;
         // Runs after commit or on a scheduler thread: always in a transaction of its own.
@@ -179,6 +181,14 @@ public class ParticipantLifecycleService {
         } catch (IllegalArgumentException notOurs) {
             return; // e.g. egress recorder participants
         }
+        Optional<UUID> meetingId = participants.findMeetingIdById(participantId);
+        if (meetingId.isEmpty()) {
+            return;
+        }
+        // The meeting row lock first, like every moderation change: the participation is then read after any change
+        // the host is making to it has committed, so neither overwrites the other (e.g. a host's media override
+        // landing as the connection is confirmed must not undo JOINED, nor be skipped for it).
+        meetings.findByIdForUpdate(meetingId.get());
         Optional<MeetingParticipant> found = participants.findById(participantId);
         if (found.isEmpty()) {
             return;
@@ -266,29 +276,10 @@ public class ParticipantLifecycleService {
         if (roomName == null) {
             return;
         }
-        Meeting meeting = meetings.findById(participant.getMeetingId()).orElse(null);
-        if (meeting == null) {
-            return;
-        }
-        String identity = participant.getId().toString();
-        String metadata = policy.metadataFor(meeting, participant);
-        var permissions = RoomNames.isAudience(roomName)
-                ? policy.audiencePermissionsFor(meeting, participant.getRole())
-                : policy.permissionsFor(meeting, participant.getRole());
-        AfterCommit.run(() -> {
-            try {
-                media.updateParticipant(roomName, identity, metadata, permissions);
-            } catch (RuntimeException e) {
-                // The connection keeps its token's rights: eject rather than let it keep rights it may no longer have.
-                log.warn("Could not apply current rights to {} in {}, disconnecting: {}", identity, roomName,
-                        e.getMessage());
-                try {
-                    media.removeParticipant(roomName, identity);
-                } catch (RuntimeException ignored) {
-                    // Nothing more can be done from here; the token expires with its TTL.
-                }
-            }
-        });
+        UUID meetingId = participant.getMeetingId();
+        UUID participantId = participant.getId();
+        // From committed state after this commit: a host change committed meanwhile is never pushed over.
+        AfterCommit.run(() -> grants.connection(meetingId, participantId, roomName));
     }
 
     /**
@@ -446,7 +437,7 @@ public class ParticipantLifecycleService {
                             "type", "role-changed", "participantId", successor.getId().toString(), "role", "CO_HOST"));
                     // SFU call after commit: never hold the meeting row lock (and a DB connection) during HTTP.
                     String metadata = policy.metadataFor(meeting, successor);
-                    var permissions = policy.permissionsFor(meeting, MeetingRole.CO_HOST);
+                    var permissions = policy.permissionsFor(meeting, successor);
                     String stageName = meeting.isStageOnly() ? policy.visibleName(meeting, successor) : null;
                     AfterCommit.run(() -> {
                         try {

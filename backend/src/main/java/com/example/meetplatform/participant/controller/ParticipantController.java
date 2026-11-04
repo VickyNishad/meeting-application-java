@@ -49,7 +49,7 @@ public class ParticipantController {
     public ResponseEntity<JoinResponse> join(@PathVariable UUID meetingId,
                                              @Valid @RequestBody(required = false) JoinRequest request,
                                              HttpServletRequest http) {
-        JoinRequest body = request == null ? new JoinRequest(null, null) : request;
+        JoinRequest body = request == null ? new JoinRequest(null, null, null) : request;
         JoinResponse response = joinService.join(meetingId, body, currentUser.current(), ClientInfo.from(http));
         return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store").body(response);
     }

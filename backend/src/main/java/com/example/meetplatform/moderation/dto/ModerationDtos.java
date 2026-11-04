@@ -1,6 +1,7 @@
 package com.example.meetplatform.moderation.dto;
 
 import com.example.meetplatform.identity.dto.UserDtos.UserSummary;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.meeting.entity.MeetingEnums.ScreenSharePolicy;
 import jakarta.validation.constraints.NotNull;
@@ -30,6 +31,17 @@ public final class ModerationDtos {
     }
 
     public record SettingsRequest(ScreenSharePolicy screenSharePolicy, Boolean waitingRoomEnabled, Boolean chatEnabled) {
+    }
+
+    /** Meeting-wide media permissions to change (null = leave as is). Host only. */
+    public record MediaPermissionsRequest(MediaPermission microphone, MediaPermission camera, MediaPermission screenShare) {
+    }
+
+    /** ALLOWED / RESTRICTED: override the meeting's permission for this participant; DEFAULT: remove the override. */
+    public enum MediaOverride { ALLOWED, RESTRICTED, DEFAULT }
+
+    /** One participant's media overrides to change (null = leave as is). Host only. */
+    public record ParticipantMediaRequest(MediaOverride microphone, MediaOverride camera, MediaOverride screenShare) {
     }
 
     public record AuditEntry(UUID id, String action, UserSummary actor, UUID actorParticipantId, String details,

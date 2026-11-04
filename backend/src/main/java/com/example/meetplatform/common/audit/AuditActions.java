@@ -43,6 +43,8 @@ public final class AuditActions {
     public static final String MOD_ROLE_CHANGE = "MOD_ROLE_CHANGE";
     public static final String MOD_LOCK = "MOD_LOCK";
     public static final String MOD_SETTINGS = "MOD_SETTINGS";
+    public static final String MOD_MEDIA_PERMISSIONS = "MOD_MEDIA_PERMISSIONS";
+    public static final String MOD_PARTICIPANT_MEDIA = "MOD_PARTICIPANT_MEDIA";
     public static final String MOD_AUTO_PROMOTE = "MOD_AUTO_PROMOTE";
 
     public static final String RECORDING_STARTED = "RECORDING_STARTED";

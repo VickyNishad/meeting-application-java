@@ -1,6 +1,8 @@
 package com.example.meetplatform.participant.entity;
 
 import com.example.meetplatform.common.persistence.AuditedEntity;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaKind;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -74,6 +76,19 @@ public class MeetingParticipant extends AuditedEntity {
     /** Webinar attendee: hidden from other attendees, whatever the meeting's visibility mode becomes later. */
     @Column(nullable = false)
     private boolean masked;
+
+    /** The host's per-participant media overrides; null = follow the meeting's permission. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "mic_override", length = 16)
+    private MediaPermission micOverride;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "camera_override", length = 16)
+    private MediaPermission cameraOverride;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "screen_override", length = 16)
+    private MediaPermission screenOverride;
 
     protected MeetingParticipant() {
     }
@@ -196,6 +211,23 @@ public class MeetingParticipant extends AuditedEntity {
 
     public void setMasked(boolean masked) {
         this.masked = masked;
+    }
+
+    /** The host's override for one medium, or null when the participant follows the meeting's permission. */
+    public MediaPermission getMediaOverride(MediaKind kind) {
+        return switch (kind) {
+            case MICROPHONE -> micOverride;
+            case CAMERA -> cameraOverride;
+            case SCREEN_SHARE -> screenOverride;
+        };
+    }
+
+    public void setMediaOverride(MediaKind kind, MediaPermission override) {
+        switch (kind) {
+            case MICROPHONE -> micOverride = override;
+            case CAMERA -> cameraOverride = override;
+            case SCREEN_SHARE -> screenOverride = override;
+        }
     }
 
     public void deny(Instant now) {

@@ -78,7 +78,7 @@ describe('ClipSession', () => {
     await flush();
     expect(a.calls).toEqual(['chunk 0 a', 'chunk 1 b', 'chunk 2 c', 'chunk 3 last', 'finish 4']);
     expect(session.done).toBe(true);
-    expect(a.impl.start).toHaveBeenCalledWith('audio/webm');
+    expect(a.impl.start).toHaveBeenCalledWith('audio/webm', expect.any(Number));
   });
 
   it('retries a failed chunk and keeps the order', async () => {
@@ -183,5 +183,64 @@ describe('clipFormat', () => {
     expect(clipFormat(false, all)).toBe('audio/webm;codecs=opus');
     expect(clipFormat(false, (t) => t === 'audio/webm')).toBe('audio/webm');
     expect(clipFormat(true, () => false)).toBeNull();
+  });
+});
+
+describe('ClipSession voice gate (no voice, nothing stored)', () => {
+  /** A gate the test decides: `hear()` confirms a voice; the session's stop() ends it otherwise. */
+  function gate() {
+    let decide: (v: boolean) => void = () => undefined;
+    const heard = new Promise<boolean>((r) => (decide = r));
+    return { gate: { heard, end: () => decide(false) }, hear: () => decide(true) };
+  }
+
+  it('drops a turn that ended without a voice: the server never hears of it', async () => {
+    const a = api();
+    const rec = new FakeRecorder();
+    const g = gate();
+    const onError = vi.fn();
+    const session = new ClipSession(a.impl, rec, 'audio/webm', onError, noSleep, undefined, g.gate);
+    rec.emit('cough');
+    session.stop();
+    await flush();
+    expect(a.impl.start).not.toHaveBeenCalled();
+    expect(a.impl.chunk).not.toHaveBeenCalled();
+    expect(a.impl.finish).not.toHaveBeenCalled();
+    expect(session.wasDiscarded).toBe(true);
+    expect(onError).not.toHaveBeenCalled();
+    await session.settled; // the next turn is not held up
+  });
+
+  it('tells the server how long ago the turn began recording, so the clip is dated from its real start', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(10_000);
+      const a = api();
+      const g = gate();
+      new ClipSession(a.impl, new FakeRecorder(), 'audio/webm', vi.fn(), noSleep, undefined, g.gate);
+      vi.setSystemTime(10_350); // the voice is confirmed 350 ms into the turn
+      g.hear();
+      await flush();
+      expect(a.impl.start).toHaveBeenCalledWith('audio/webm', 350);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stores a turn once a voice is heard, including what was recorded before', async () => {
+    const a = api();
+    const rec = new FakeRecorder();
+    const g = gate();
+    const session = new ClipSession(a.impl, rec, 'audio/webm', vi.fn(), noSleep, undefined, g.gate);
+    rec.emit('a');
+    await flush();
+    expect(a.impl.start).not.toHaveBeenCalled(); // not before a voice
+    g.hear();
+    a.answerStart();
+    rec.emit('b');
+    session.stop();
+    await flush();
+    expect(a.calls).toEqual(['chunk 0 a', 'chunk 1 b', 'chunk 2 last', 'finish 3']);
+    expect(session.wasDiscarded).toBe(false);
   });
 });

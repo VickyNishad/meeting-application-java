@@ -13,12 +13,14 @@ import com.example.meetplatform.identity.service.UserService;
 import com.example.meetplatform.media.service.MediaService;
 import com.example.meetplatform.media.service.RoomSignals;
 import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaKind;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingStatus;
 import com.example.meetplatform.meeting.entity.MeetingEnums.Privacy;
 import com.example.meetplatform.meeting.repository.MeetingRepository;
 import com.example.meetplatform.meeting.service.MeetingAccessService;
 import com.example.meetplatform.meeting.service.MeetingService;
+import com.example.meetplatform.participant.dto.ParticipantDtos;
 import com.example.meetplatform.participant.dto.ParticipantDtos.JoinRequest;
 import com.example.meetplatform.participant.dto.ParticipantDtos.JoinResponse;
 import com.example.meetplatform.participant.dto.ParticipantDtos.JoinStatus;
@@ -107,7 +109,7 @@ public class JoinService {
         }
 
         Optional<MeetingRoom> activeRoom = roomSessions.active(meetingId);
-        Optional<MeetingParticipant> previous = userId == null ? Optional.empty()
+        Optional<MeetingParticipant> previous = userId == null ? provenGuestParticipation(meetingId, request.rejoin())
                 : participants.findFirstByMeetingIdAndUserIdOrderByCreatedAtDesc(meetingId, userId);
         if (previous.isPresent() && activeRoom.isPresent() && previous.get().getState() == State.REMOVED
                 && activeRoom.get().getId().equals(previous.get().getRoomId())) {
@@ -143,6 +145,14 @@ public class JoinService {
         if (participant == null) {
             participant = new MeetingParticipant(meetingId, room == null ? null : room.getId(), userId, displayName,
                     role, Tokens.sha256(waitToken), client.ipAddress());
+            // Back in the same session after the reconnect window: the host's media overrides for this account (or
+            // guest participation proven by its secret) still apply.
+            MeetingParticipant before = previous.orElse(null);
+            if (before != null && room != null && room.getId().equals(before.getRoomId())) {
+                for (MediaKind kind : MediaKind.values()) {
+                    participant.setMediaOverride(kind, before.getMediaOverride(kind));
+                }
+            }
         } else {
             participant.setWaitTokenHash(Tokens.sha256(waitToken));
         }
@@ -268,6 +278,18 @@ public class JoinService {
                         || (room != null && room.getId().equals(p.getRoomId()) && p.leftWithin(now, reconnectWindow)))
                 .filter(p -> room == null ? p.getRoomId() == null
                         : p.getRoomId() == null || room.getId().equals(p.getRoomId()));
+    }
+
+    /**
+     * A guest's earlier participation in this meeting, when the guest proves it with the participant secret it was given
+     * (a guest has no account to recognise it by). Anything that does not match is ignored: the guest joins as new.
+     */
+    private Optional<MeetingParticipant> provenGuestParticipation(UUID meetingId, ParticipantDtos.Rejoin rejoin) {
+        if (rejoin == null) {
+            return Optional.empty();
+        }
+        return participants.findByIdAndMeetingId(rejoin.participantId(), meetingId)
+                .filter(p -> p.getUserId() == null && Tokens.matchesHash(rejoin.token(), p.getWaitTokenHash()));
     }
 
     private long occupiedSeats(MeetingRoom room) {

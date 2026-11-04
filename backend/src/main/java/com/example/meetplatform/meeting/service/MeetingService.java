@@ -177,7 +177,9 @@ public class MeetingService {
         if (request.description() != null) {
             meeting.setDescription(blankToNull(request.description()));
         }
+        boolean mediaSettingsChanged = false;
         if (request.mediaMode() != null) {
+            mediaSettingsChanged = request.mediaMode() != meeting.getMediaMode();
             meeting.setMediaMode(request.mediaMode());
         }
         if (request.privacy() != null) {
@@ -240,9 +242,14 @@ public class MeetingService {
             meeting.setMaxParticipants(capacity(request.maxParticipants()));
         }
         if (request.screenSharePolicy() != null) {
+            mediaSettingsChanged |= request.screenSharePolicy() != meeting.getScreenSharePolicy();
             meeting.setScreenSharePolicy(request.screenSharePolicy());
         }
         meetings.flush();
+        if (mediaSettingsChanged) {
+            // Enforced in a live session like the host's in-meeting media permissions.
+            events.publishEvent(new MeetingEvents.MediaSettingsChanged(meetingId));
+        }
         audit.record(AuditActions.MEETING_UPDATED, AuditActions.RESOURCE_MEETING, meetingId,
                 Map.of("rescheduled", rescheduled));
         if (rescheduled) {

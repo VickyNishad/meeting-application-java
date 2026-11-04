@@ -5,10 +5,14 @@ import com.example.meetplatform.common.security.CurrentUserProvider;
 import com.example.meetplatform.meeting.dto.MeetingDtos.MeetingView;
 import com.example.meetplatform.moderation.dto.ModerationDtos.AuditEntry;
 import com.example.meetplatform.moderation.dto.ModerationDtos.LockRequest;
+import com.example.meetplatform.moderation.dto.ModerationDtos.MediaPermissionsRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.MuteRequest;
+import com.example.meetplatform.moderation.dto.ModerationDtos.ParticipantMediaRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.RequestUnmuteRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.RoleRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.SettingsRequest;
+import com.example.meetplatform.participant.dto.RoomStateDtos.MediaPermissionsView;
+import com.example.meetplatform.participant.dto.RoomStateDtos.ParticipantMedia;
 import com.example.meetplatform.moderation.service.ModerationService;
 import com.example.meetplatform.participant.dto.ParticipantDtos.ParticipantView;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -105,6 +109,20 @@ public class ModerationController {
     @PutMapping("/settings")
     public MeetingView settings(@PathVariable UUID meetingId, @Valid @RequestBody SettingsRequest request) {
         return service.settings(meetingId, request, currentUser.require());
+    }
+
+    /** Meeting-wide media permissions (host only). */
+    @PutMapping("/media-permissions")
+    public MediaPermissionsView mediaPermissions(@PathVariable UUID meetingId,
+                                                 @Valid @RequestBody MediaPermissionsRequest request) {
+        return service.mediaPermissions(meetingId, request, currentUser.require());
+    }
+
+    /** One participant's media overrides (host only). */
+    @PutMapping("/participants/{participantId}/media-permissions")
+    public ParticipantMedia participantMediaPermissions(@PathVariable UUID meetingId, @PathVariable UUID participantId,
+                                                        @Valid @RequestBody ParticipantMediaRequest request) {
+        return service.participantMediaPermissions(meetingId, participantId, request, currentUser.require());
     }
 
     @GetMapping("/audit")

@@ -19,19 +19,27 @@ import com.example.meetplatform.media.service.RoomNames;
 import com.example.meetplatform.media.service.RoomSignals;
 import com.example.meetplatform.meeting.dto.MeetingDtos.MeetingView;
 import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaKind;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.meeting.repository.MeetingRepository;
 import com.example.meetplatform.meeting.service.MeetingAccessService;
 import com.example.meetplatform.meeting.service.MeetingPermissions;
 import com.example.meetplatform.meeting.service.MeetingService;
 import com.example.meetplatform.moderation.dto.ModerationDtos.AuditEntry;
+import com.example.meetplatform.moderation.dto.ModerationDtos.MediaOverride;
+import com.example.meetplatform.moderation.dto.ModerationDtos.MediaPermissionsRequest;
+import com.example.meetplatform.moderation.dto.ModerationDtos.ParticipantMediaRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.MuteSource;
 import com.example.meetplatform.moderation.dto.ModerationDtos.SettingsRequest;
 import com.example.meetplatform.moderation.dto.ModerationDtos.UnmuteSource;
 import com.example.meetplatform.participant.dto.ParticipantDtos.ParticipantView;
+import com.example.meetplatform.participant.dto.RoomStateDtos.MediaPermissionsView;
+import com.example.meetplatform.participant.dto.RoomStateDtos.ParticipantMedia;
 import com.example.meetplatform.participant.entity.MeetingParticipant;
 import com.example.meetplatform.participant.entity.MeetingParticipant.State;
 import com.example.meetplatform.participant.repository.MeetingParticipantRepository;
+import com.example.meetplatform.participant.service.MediaGrantSync;
 import com.example.meetplatform.participant.service.ParticipantPolicy;
 import com.example.meetplatform.participant.service.RoomAudience;
 import com.example.meetplatform.room.entity.MeetingRoom;
@@ -47,6 +55,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -85,12 +94,14 @@ public class ModerationService {
     private final TransactionTemplate readTx;
     private final RoomAudience audience;
     private final Clock clock;
+    private final MediaGrantSync grants;
 
     public ModerationService(MeetingRepository meetings, MeetingService meetingService, MeetingAccessService access,
                              MeetingPermissions permissions, MeetingParticipantRepository participants,
                              RoomSessionService roomSessions, ParticipantPolicy policy, MediaService media,
                              RoomSignals signals, AuditService audit, AuditLogRepository auditLogs, UserService users,
-                             TransactionTemplate tx, RoomAudience audience, Clock clock) {
+                             TransactionTemplate tx, RoomAudience audience, Clock clock, MediaGrantSync grants) {
+        this.grants = grants;
         this.audience = audience;
         this.meetings = meetings;
         this.meetingService = meetingService;
@@ -332,6 +343,9 @@ public class ModerationService {
             return result;
         });
         applyMediaUpdates(updates);
+        // The host's view of this person's media rights: a co-host has every right, a participant the meeting's and the
+        // host's overrides.
+        grants.announceToHost(meetingId, List.of(participantId));
     }
 
     // ------------------------------------------------------------------ room settings
@@ -349,13 +363,15 @@ public class ModerationService {
     }
 
     public MeetingView settings(UUID meetingId, SettingsRequest request, CurrentUser user) {
-        List<MediaUpdate> updates = new ArrayList<>();
+        boolean[] pushGrants = {false};
         MeetingView view = tx.execute(s -> {
             ModeratorContext ctx = resolveModerator(meetingId, user, MeetingPermissions.MODERATE, false);
             Meeting meeting = ctx.meeting;
             boolean policyChanged = request.screenSharePolicy() != null
                     && request.screenSharePolicy() != meeting.getScreenSharePolicy();
             if (request.screenSharePolicy() != null) {
+                // The meeting-wide screen-sharing permission: the host's, like the other media permissions.
+                requireHost(ctx);
                 meeting.setScreenSharePolicy(request.screenSharePolicy());
             }
             if (request.waitingRoomEnabled() != null) {
@@ -365,10 +381,7 @@ public class ModerationService {
                 meeting.setChatEnabled(request.chatEnabled());
             }
             if (ctx.room != null) {
-                if (policyChanged) {
-                    updates.addAll(mediaUpdates(ctx,
-                            participants.findByRoomIdAndStateIn(ctx.room.getId(), MeetingParticipant.PRESENT), false));
-                }
+                pushGrants[0] = policyChanged;
                 signals.broadcast(ctx.room.getLivekitRoomName(), RoomSignals.TOPIC_MODERATION, Map.of("type", "settings",
                         "screenSharePolicy", meeting.getScreenSharePolicy().name(), "chatEnabled", meeting.isChatEnabled()));
             }
@@ -377,8 +390,96 @@ public class ModerationService {
                             meeting.isWaitingRoomEnabled(), "chatEnabled", meeting.isChatEnabled()));
             return meetingService.view(meeting, ctx.role);
         });
-        applyMediaUpdates(updates);
+        if (pushGrants[0]) {
+            grants.everyone(meetingId);
+        }
         return view;
+    }
+
+    // ------------------------------------------------------------------ media permissions (host only)
+
+    /**
+     * Meeting-wide microphone / camera / screen-sharing permissions. Host only. Saved under the meeting row lock (so
+     * concurrent changes apply in order), then, from what is committed, pushed to every participant of the live
+     * session on the SFU, which refuses to publish a source that is not allowed and unpublishes a track whose source
+     * is no longer allowed.
+     */
+    public MediaPermissionsView mediaPermissions(UUID meetingId, MediaPermissionsRequest request, CurrentUser user) {
+        if (request.microphone() == null && request.camera() == null && request.screenShare() == null) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED, "Give at least one of microphone, camera, screenShare.");
+        }
+        MediaPermissionsView view = tx.execute(s -> {
+            ModeratorContext ctx = resolveModerator(meetingId, user, MeetingPermissions.MODERATE, false);
+            requireHost(ctx);
+            Meeting meeting = ctx.meeting;
+            setIfGiven(meeting, MediaKind.MICROPHONE, request.microphone());
+            setIfGiven(meeting, MediaKind.CAMERA, request.camera());
+            setIfGiven(meeting, MediaKind.SCREEN_SHARE, request.screenShare());
+            MediaPermissionsView changed = policy.mediaPermissions(meeting);
+            audit.record(user.userId(), null, AuditActions.MOD_MEDIA_PERMISSIONS, AuditActions.RESOURCE_MEETING,
+                    meetingId, Map.of("microphone", changed.microphone(), "camera", changed.camera(),
+                            "screenShare", changed.screenShare()));
+            return changed;
+        });
+        grants.everyone(meetingId);
+        return view;
+    }
+
+    /**
+     * One participant's media overrides (ALLOWED / RESTRICTED override the meeting's permission, DEFAULT removes the
+     * override). Host only; the participant must be in this meeting's live session. Hosts and co-hosts always have
+     * full media rights, so they take no overrides.
+     */
+    public ParticipantMedia participantMediaPermissions(UUID meetingId, UUID participantId, ParticipantMediaRequest request,
+                                                        CurrentUser user) {
+        if (request.microphone() == null && request.camera() == null && request.screenShare() == null) {
+            throw new ApiException(ErrorCode.VALIDATION_FAILED, "Give at least one of microphone, camera, screenShare.");
+        }
+        ParticipantMedia view = tx.execute(s -> {
+            ModeratorContext ctx = resolveModerator(meetingId, user, MeetingPermissions.MODERATE, true);
+            requireHost(ctx);
+            MeetingParticipant p = presentTarget(ctx, participantId);
+            if (p.getRole().isModerator()) {
+                throw new ApiException(ErrorCode.CONFLICT, "Hosts and co-hosts always have full media permissions.");
+            }
+            overrideIfGiven(p, MediaKind.MICROPHONE, request.microphone());
+            overrideIfGiven(p, MediaKind.CAMERA, request.camera());
+            overrideIfGiven(p, MediaKind.SCREEN_SHARE, request.screenShare());
+            ParticipantMedia changed = policy.participantMedia(ctx.meeting, p);
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("participantId", participantId);
+            details.put("microphone", request.microphone());
+            details.put("camera", request.camera());
+            details.put("screenShare", request.screenShare());
+            details.values().removeIf(Objects::isNull);
+            audit.record(user.userId(), null, AuditActions.MOD_PARTICIPANT_MEDIA, AuditActions.RESOURCE_MEETING,
+                    meetingId, details);
+            return changed;
+        });
+        grants.participants(meetingId, List.of(participantId), true);
+        return view;
+    }
+
+    private static void requireHost(ModeratorContext ctx) {
+        if (ctx.role != MeetingRole.HOST) {
+            throw ApiException.forbidden("Only the host can change media permissions.");
+        }
+    }
+
+    private static void setIfGiven(Meeting meeting, MediaKind kind, MediaPermission permission) {
+        if (permission != null) {
+            meeting.setMediaPermission(kind, permission);
+        }
+    }
+
+    private static void overrideIfGiven(MeetingParticipant p, MediaKind kind, MediaOverride override) {
+        if (override != null) {
+            p.setMediaOverride(kind, switch (override) {
+                case ALLOWED -> MediaPermission.ALLOWED;
+                case RESTRICTED -> MediaPermission.RESTRICTED;
+                case DEFAULT -> null;
+            });
+        }
     }
 
     @Transactional(readOnly = true)
@@ -456,11 +557,11 @@ public class ModerationService {
             }
             String metadata = policy.metadataFor(ctx.meeting, p);
             updates.add(new MediaUpdate(stageRoom, p.getId().toString(), metadata,
-                    policy.permissionsFor(ctx.meeting, p.getRole()), rename ? policy.visibleName(ctx.meeting, p) : null));
+                    policy.permissionsFor(ctx.meeting, p), rename ? policy.visibleName(ctx.meeting, p) : null));
             if (ctx.meeting.isStageOnly()) {
                 // Its own audience room: an attendee publishes there; once promoted it may only watch.
                 updates.add(new MediaUpdate(RoomNames.audience(stageRoom, p.getId()), p.getId().toString(), metadata,
-                        policy.audiencePermissionsFor(ctx.meeting, p.getRole()), null));
+                        policy.audiencePermissionsFor(ctx.meeting, p), null));
             }
         }
         return updates;

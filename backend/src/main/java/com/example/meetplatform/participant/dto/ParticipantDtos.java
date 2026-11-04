@@ -4,6 +4,7 @@ import com.example.meetplatform.meeting.dto.MeetingDtos.MeetingView;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.participant.entity.MeetingParticipant;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
@@ -17,7 +18,15 @@ public final class ParticipantDtos {
 
     public enum JoinStatus { ADMITTED, WAITING, DENIED }
 
-    public record JoinRequest(@Size(max = 64) String password, @Size(min = 1, max = 120) String displayName) {
+    /**
+     * {@code rejoin}: a guest joining the meeting again from the same browser proves its earlier participation (id and
+     * participant secret), so the host's media restrictions on it still apply. Ignored for signed-in users.
+     */
+    public record JoinRequest(@Size(max = 64) String password, @Size(min = 1, max = 120) String displayName,
+                              @Valid Rejoin rejoin) {
+    }
+
+    public record Rejoin(@NotNull UUID participantId, @NotNull @Size(max = 128) String token) {
     }
 
     /**

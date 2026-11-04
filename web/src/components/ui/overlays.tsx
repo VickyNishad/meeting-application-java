@@ -5,8 +5,9 @@ import {
   DropdownMenu as DropdownPrimitive,
   Popover as PopoverPrimitive,
   Tabs as TabsPrimitive,
+  Tooltip as TooltipPrimitive,
 } from 'radix-ui';
-import { X } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { buttonVariants } from './button';
 
@@ -164,6 +165,21 @@ export const DropdownMenuRadioItem = React.forwardRef<
 ));
 DropdownMenuRadioItem.displayName = 'DropdownMenuRadioItem';
 
+export const DropdownMenuCheckboxItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownPrimitive.CheckboxItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownPrimitive.CheckboxItem>
+>(({ className, children, ...props }, ref) => (
+  <DropdownPrimitive.CheckboxItem ref={ref} className={cn(itemCls, 'pl-7', className)} {...props}>
+    <span className="absolute left-2 flex size-3.5 items-center justify-center">
+      <DropdownPrimitive.ItemIndicator>
+        <Check aria-hidden="true" />
+      </DropdownPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownPrimitive.CheckboxItem>
+));
+DropdownMenuCheckboxItem.displayName = 'DropdownMenuCheckboxItem';
+
 export function DropdownMenuLabel({ className, ...props }: React.ComponentPropsWithoutRef<typeof DropdownPrimitive.Label>) {
   return <DropdownPrimitive.Label className={cn('px-2 py-1.5 text-xs font-semibold text-muted-foreground', className)} {...props} />;
 }
@@ -224,3 +240,24 @@ export const TabsContent = React.forwardRef<
   <TabsPrimitive.Content ref={ref} className={cn('mt-4 focus-visible:outline-none', className)} {...props} />
 ));
 TabsContent.displayName = 'TabsContent';
+
+// ---- Tooltip ------------------------------------------------------------------------------------
+export const TooltipProvider = TooltipPrimitive.Provider;
+
+/** A short hint on hover / keyboard focus. The trigger keeps its own accessible name. */
+export function Tooltip({ content, children, side = 'top' }: { content: React.ReactNode; children: React.ReactNode; side?: 'top' | 'bottom' | 'left' | 'right' }) {
+  return (
+    <TooltipPrimitive.Root>
+      <TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>
+      <TooltipPrimitive.Portal>
+        <TooltipPrimitive.Content
+          side={side}
+          sideOffset={8}
+          className="z-50 max-w-64 rounded-md border border-white/10 bg-neutral-800 px-2.5 py-1.5 text-xs font-medium text-neutral-100 shadow-lg"
+        >
+          {content}
+        </TooltipPrimitive.Content>
+      </TooltipPrimitive.Portal>
+    </TooltipPrimitive.Root>
+  );
+}

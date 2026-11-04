@@ -11,13 +11,14 @@ import com.example.meetplatform.common.response.PageResponse;
 import com.example.meetplatform.common.security.CurrentUser;
 import com.example.meetplatform.common.security.RateLimiter;
 import com.example.meetplatform.meeting.entity.Meeting;
+import com.example.meetplatform.meeting.event.MeetingEvents;
 import com.example.meetplatform.meeting.repository.MeetingRepository;
 import com.example.meetplatform.participant.entity.MeetingParticipant;
 import com.example.meetplatform.participant.service.ParticipantAccessService;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.AccessUrl;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Facets;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.FinishRequest;
-import com.example.meetplatform.recording.dto.SpeechRecordingDtos.Option;
+import com.example.meetplatform.recording.dto.SpeechRecordingDtos.MeetingOption;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.ParticipantOption;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.SpeechRecordingView;
 import com.example.meetplatform.recording.dto.SpeechRecordingDtos.StartRequest;
@@ -29,6 +30,7 @@ import jakarta.persistence.criteria.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
@@ -61,6 +63,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Speaking clips: each participant's browser records its own microphone (and camera) while the media server reports
@@ -81,6 +85,8 @@ import java.util.UUID;
 public class SpeechRecordingService {
 
     private static final Logger log = LoggerFactory.getLogger(SpeechRecordingService.class);
+    /** How far before the request a clip may be dated (the browser waits for a voice before asking). */
+    static final Duration MAX_START_BACKDATE = Duration.ofSeconds(10);
     public static final String CONTENT_PATH = "/api/v1/speech-recordings/{id}/content";
     private static final DateTimeFormatter QUERY_DATE = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final DateTimeFormatter FOLDER_DATE = DateTimeFormatter.ofPattern("dd-MM-yyyy");
@@ -101,6 +107,7 @@ public class SpeechRecordingService {
     private final Duration accessTtl;
     private final String publicUrl;
     private final byte[] signingKey;
+    private final ApplicationEventPublisher events;
 
     public SpeechRecordingService(SpeechRecordingRepository recordings, MeetingRepository meetings,
                                   ParticipantAccessService participantAccess, RoomSessionService roomSessions,
@@ -109,7 +116,9 @@ public class SpeechRecordingService {
                                   TransactionTemplate tx, AppProperties properties, Clock clock,
                                   @Value("${app.speech-recordings.max-chunk-bytes:8388608}") long maxChunkBytes,
                                   @Value("${app.speech-recordings.max-clip-bytes:524288000}") long maxClipBytes,
-                                  @Value("${app.speech-recordings.access-url-ttl:PT10M}") Duration accessTtl) {
+                                  @Value("${app.speech-recordings.access-url-ttl:PT10M}") Duration accessTtl,
+                                  ApplicationEventPublisher events) {
+        this.events = events;
         this.recordings = recordings;
         this.meetings = meetings;
         this.participantAccess = participantAccess;
@@ -153,7 +162,11 @@ public class SpeechRecordingService {
         }
         recordings.flush();
 
-        Instant start = clock.instant();
+        // Dated from when the browser began recording the turn (it asks only once it heard a voice), within bounds:
+        // never in the future, never more than MAX_START_BACKDATE before the request.
+        long ago = request.recordingStartedMsAgo() == null ? 0
+                : Math.min(request.recordingStartedMsAgo(), MAX_START_BACKDATE.toMillis());
+        Instant start = clock.instant().minusMillis(ago);
         ZoneId zone = zoneOf(meeting);
         String format = request.format().toLowerCase(Locale.ROOT).split(";")[0].strip();
         // The name: start time to the second plus 24 random bits; a name already on disk is skipped, and the unique
@@ -168,6 +181,8 @@ public class SpeechRecordingService {
                     participant.getUserId(), meeting.getHostId(), meeting.getTitle(), participant.getDisplayName(),
                     SpeechClipStorage.fileName(start, zone, uniqueId), path, format, start);
             recordings.saveAndFlush(clip);
+            // The browser opens a clip only once it hears a voice: the first one starts automatic recording of the meeting.
+            events.publishEvent(new MeetingEvents.SpeechDetected(meetingId, participant.getId()));
             return SpeechRecordingView.of(clip);
         }
         throw new ApiException(ErrorCode.CONFLICT, "Could not reserve a file name for the recording. Try again.");
@@ -338,18 +353,46 @@ public class SpeechRecordingService {
     public Facets facets(CurrentUser user, String view) {
         boolean hosted = isHosted(view);
         UUID id = user.userId();
-        List<Option> meetingOptions = options(hosted ? recordings.hostedMeetings(id) : recordings.ownMeetings(id));
-        List<ParticipantOption> participantOptions = (hosted ? recordings.hostedParticipants(id) : recordings.ownParticipants(id))
-                .stream()
-                .map(r -> new ParticipantOption((UUID) r[0], (String) r[1], (UUID) r[2]))
+        List<MeetingOption> meetingOptions = meetingOptions(hosted ? recordings.hostedMeetings(id) : recordings.ownMeetings(id));
+        List<ParticipantOption> participantOptions =
+                participantOptions(hosted ? recordings.hostedParticipants(id) : recordings.ownParticipants(id));
+        List<String> dates = queryDates((hosted ? recordings.hostedDates(id) : recordings.ownDates(id)).stream());
+        return new Facets(meetingOptions, participantOptions, dates);
+    }
+
+    /** Rows (meetingId, title, folder date, latest start): one option per meeting, under its most recent title. */
+    private static List<MeetingOption> meetingOptions(List<Object[]> rows) {
+        Map<UUID, List<Object[]>> byMeeting = rows.stream().collect(Collectors.groupingBy(r -> (UUID) r[0]));
+        return byMeeting.entrySet().stream()
+                .map(e -> {
+                    String title = (String) e.getValue().stream().max(Comparator.comparing(r -> (Instant) r[3])).orElseThrow()[1];
+                    return new MeetingOption(e.getKey(), title, queryDates(e.getValue().stream().map(r -> (String) r[2])));
+                })
+                .sorted(Comparator.comparing(MeetingOption::label, String.CASE_INSENSITIVE_ORDER))
+                .toList();
+    }
+
+    /** Rows (participantId, name, meetingId, folder date, host): one option per participation. */
+    private static List<ParticipantOption> participantOptions(List<Object[]> rows) {
+        Map<UUID, List<Object[]>> byParticipant = rows.stream().collect(Collectors.groupingBy(r -> (UUID) r[0]));
+        return byParticipant.entrySet().stream()
+                .map(e -> {
+                    Object[] first = e.getValue().getFirst();
+                    boolean host = e.getValue().stream().anyMatch(r -> Boolean.TRUE.equals(r[4]));
+                    return new ParticipantOption(e.getKey(), (String) first[1], (UUID) first[2], host,
+                            queryDates(e.getValue().stream().map(r -> (String) r[3])));
+                })
                 .sorted(Comparator.comparing(ParticipantOption::label, String.CASE_INSENSITIVE_ORDER))
                 .toList();
-        List<String> dates = (hosted ? recordings.hostedDates(id) : recordings.ownDates(id)).stream()
+    }
+
+    /** Folder dates (DD-MM-YYYY) as distinct YYYY-MM-DD, newest first. */
+    private static List<String> queryDates(Stream<String> folderDates) {
+        return folderDates.distinct()
                 .map(d -> LocalDate.parse(d, FOLDER_DATE))
                 .sorted(Comparator.reverseOrder())
                 .map(QUERY_DATE::format)
                 .toList();
-        return new Facets(meetingOptions, participantOptions, dates);
     }
 
     @Transactional(readOnly = true)
@@ -416,11 +459,6 @@ public class SpeechRecordingService {
             return false;
         }
         throw new ApiException(ErrorCode.VALIDATION_FAILED, "view must be \"hosted\" or \"mine\".");
-    }
-
-    private static List<Option> options(List<Object[]> rows) {
-        return rows.stream().map(r -> new Option((UUID) r[0], (String) r[1]))
-                .sorted(Comparator.comparing(Option::label, String.CASE_INSENSITIVE_ORDER)).toList();
     }
 
     private static ZoneId zoneOf(Meeting meeting) {

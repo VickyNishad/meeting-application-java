@@ -58,7 +58,7 @@ describe('GridStage (QA SP-2, SP-6)', () => {
     const people = ['a', 'b', 'c'].map(person);
     const tracks = people.map((participant) => ({ participant, source: 'camera' }));
     const room = new FakeEmitter() as unknown as Room;
-    const ctx = { names: {} } as unknown as MeetingRoomState;
+    const ctx = { names: {}, raisedHands: {} } as unknown as MeetingRoomState;
     render(
       <MeetingRoomContext.Provider value={ctx}>
         <GridStage tracks={tracks as never} speakerRooms={[room]} />

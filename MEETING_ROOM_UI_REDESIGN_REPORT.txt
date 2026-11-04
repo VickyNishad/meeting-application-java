@@ -1,0 +1,178 @@
+MEETING ROOM UI REDESIGN
+Report
+Date: 2026-11-04
+Status: implemented, tested and deployed locally. The independent QA review found the issues in section 6;
+NONE of them is fixed yet, pending the owner's approval. Nothing is committed.
+
+==========================================================================================
+1. REQUEST AND AGREED SCOPE
+==========================================================================================
+"Make a professional UI: alignment, position, font, border; also check the right-side panel."
+Approved choices: labels under the icons; Inter font bundled with the app; meeting room only
+(control bar, header and the three side panels). Behaviour must not change.
+
+==========================================================================================
+2. PROBLEMS FOUND BEFORE THE CHANGE
+==========================================================================================
+- Icon-only round buttons: several meanings unclear (the plain circle = local recording, the shield
+  = host controls).
+- The mic/camera device chevron was a separate small circle overlapping the button.
+- Mixed shapes and sizes (44px circles, 28px chevron, wide red Leave pill); one centred row with
+  no grouping.
+- Muted state used the same solid red as Leave; active panel used the same blue as screen share.
+- The app asked for the Inter font but never loaded it, so text fell back to the system font.
+- Side panel glued to the stage (1px border only), small header, dense participant rows, host
+  controls without clear groups, plain chat bubbles.
+
+==========================================================================================
+3. WHAT CHANGED (files)
+==========================================================================================
+web/src/pages/room/ControlBar.tsx
+  - Three zones: left = clock + meeting code (screens >= 1280px); centre = microphone and camera
+    (split buttons: main button + joined device chevron), Share, Raise hand, React, Record;
+    right = Chat, Participants, Host, divider, Leave.
+  - One button style: rounded square, 48px (56px from 1024px), label under the icon from 1024px,
+    icon-only with tooltips at 768-1023px, and below 768px a short bar
+    (mic, camera, record, More, Leave) with a "More" menu for share, hand, reactions and panels.
+  - States: neutral; off (red tint, not solid red); active panel (blue tint); screen share on
+    (solid blue); hand raised (amber); restricted by the host (lock + disabled + tooltip).
+  - Count badges for unread chat (red) and people waiting (amber).
+  - Accessible names (aria-label) kept exactly as before.
+web/src/components/ui/overlays.tsx   new Tooltip primitive (Radix).
+web/src/main.tsx, web/src/index.css, web/package.json, package-lock.json
+  - @fontsource-variable/inter 5.3.0 bundled (served from our own origin; no CSP change).
+web/src/pages/room/RoomView.tsx
+  - Side panel: floating rounded card with border and shadow from 640px (360px, 400px on large
+    screens); bottom sheet with a dimmed backdrop (tap to close) on phones.
+web/src/pages/room/PanelChrome.tsx
+  - Panel header with icon, title, count chip and close button (chevron on phones); shared
+    PanelSection (card) and SettingRow (label + hint left, control right) components.
+web/src/pages/room/ParticipantsPanel.tsx
+  - Search by name, "In the meeting - n" heading, notice when people are waiting (host),
+    one chip style for role / sharing / restrictions, mic and camera status in equal circles,
+    actions button always visible, rows aligned even without an actions button.
+web/src/pages/room/ModerationPanel.tsx
+  - Sections as cards (Waiting room, Audio, Media permissions, Meeting settings, Cloud recording),
+    every switch row aligned with a hint; subdued "Mute everyone" button; waiting list rows with
+    avatar and admit/deny.
+web/src/pages/room/ChatPanel.tsx
+  - Messages grouped by sender (name, avatar and time once), rounded bubbles, empty state,
+    40px input and Send button, tidier tabs.
+
+==========================================================================================
+4. TESTS AND ACTUAL RESULTS
+==========================================================================================
+- Web unit tests (vitest): 239/239 passed. ESLint: 0 warnings. TypeScript build: clean.
+  No existing test had to change.
+- Live end-to-end test (real browsers, real LiveKit, host + 2 guests): 41/41 passed after the
+  redesign (all media-permission behaviour unchanged).
+- Screenshots of a real meeting (host, participants, restricted participant) at 1440, 1280, 900
+  and 390px, with measured page width: no horizontal overflow at any size, 0 error toasts.
+  Location: scratchpad\audio\out\ui-*.png (session scratchpad).
+
+==========================================================================================
+5. INDEPENDENT QA - VERIFIED OK
+==========================================================================================
+- No page overflow or overlapping controls at 360/390/768/900/1024/1280/1920 and 600px height;
+  breakpoints behave as specified; one control height per breakpoint.
+- States: restricted mic (lock, disabled, tooltip on hover and keyboard focus), hand raised,
+  screen share, local recording timer, unread / waiting badges, audio-only, webinar attendee.
+- Panels: card / bottom sheet, close by X / chevron / backdrop, 7 participants with long names
+  aligned, search and empty states, aligned host switches.
+- Keyboard: logical tab order, visible focus rings, tooltips on focus, More menu by keyboard.
+  Text contrast >= 4.5:1. No CSP or console errors.
+- Regressions: mute/unmute, camera, hand, reactions, chat send, participant actions, host switches,
+  device menu with noise reduction, leave dialogs - all work.
+
+==========================================================================================
+6. INDEPENDENT QA FINDINGS (NOT FIXED - awaiting approval)
+==========================================================================================
+High
+ Q1  Chat: a long unbroken word / URL does not wrap; the message list scrolls sideways
+     (regression of the new bubble layout). Fix: overflow-wrap:anywhere / max-w-full on the bubble.
+ Q2  Host's participant actions menu (about 550px tall) runs off the bottom of the screen for lower
+     rows; "Remove from meeting" can become unreachable. Fix: limit its height to the available
+     space with scrolling, or move the media permissions into a submenu.
+Medium
+ Q3  Inter is not used inside the meeting room: LiveKit's own stylesheet sets a system font on the
+     room container, which the bar, header and panels inherit. Fix: set the room container's font to
+     the app font.
+ Q4  Phone "More" menu: the emoji row (8 emoji) is wider than the menu; two are hidden and keyboard
+     arrowing shifts the menu sideways. Fix: wrap into rows.
+ Q5  Visible label vs spoken name differs in three states (restricted "Unmute", "Stop share",
+     "REC 00:02"). Fix: start each accessible name with the visible text.
+ Q6  At about 640px with a panel open the video area is only about 256px wide. Fix: use the bottom
+     sheet up to 768px.
+Low
+ Q7  Escape does not close a side panel; opening a panel from the phone menu does not move focus
+     into it.
+ Q8  Phone "More" badge adds unread chat and waiting people into one red number.
+ Q9  At 1280px (host) the centre and right groups are only 12px apart; the centre group is a bit
+     off-centre.
+ Q10 Some labelled buttons are wider (Participants, Stop share, REC), so the bar shifts slightly
+     when sharing or recording starts.
+ Q11 No tooltip on the icon-only Leave button at 768-1023px.
+ Q12 Two separators in a row in the host's participant actions menu.
+ Q13 Host controls panel shows the light system scrollbar on the dark background.
+ Q14 The focusable wrapper around a disabled (restricted) button has no role or name.
+ Q15 To check, probably older than this change: no raised-hand marker on video tiles; in a webinar,
+     attendees appear as "Attendee" in the host's participants list instead of their name.
+
+==========================================================================================
+7. REMAINING NOTES
+==========================================================================================
+- The Inter font is app-wide by nature (it was already the intended font of the whole app).
+- A browser tab opened before the deployment keeps the old UI until it is reloaded (Ctrl+Shift+R).
+- Pre-existing, not caused by this change: LiveKit grid "updatePages" console errors when camera
+  tiles change.
+
+==========================================================================================
+8. ROUND 2 (2026-11-04): Q1-Q15 FIXED ("Fix All") + DASHBOARD REDESIGN ("approve dashboard")
+==========================================================================================
+Q1-Q15 fixes
+  Q1  ChatPanel bubble: max-w-full + overflow-wrap:anywhere.
+  Q2  Participant actions menu limited to the available height (scrolls), collision padding.
+  Q3  index.css: LiveKit font variable set to the app font; LiveKit's unlayered
+      "[data-lk-theme] button, input { font: inherit; line-height: inherit }" handed back to the app's
+      styles (font: revert-layer). This was also why bar labels were clipped and panel tabs too large.
+  Q4  Phone More menu: emoji in a 4-column grid.
+  Q5  Visible labels contained in accessible names: "Restricted", "Stop sharing",
+      "REC mm:ss, stop local recording", "React with an emoji" (these accessible names changed).
+  Q6  Bottom sheet up to 768px (was 640px).
+  Q7  Escape closes a side panel (not while a menu/dialog is open); opening a panel focuses its title.
+  Q8  More button: separate red (unread) and amber (waiting) badges; label mentions both.
+  Q9/Q10 One fixed button width (48px; 84px with labels from 1280px); clock + meeting code from 1536px
+      in a three-column grid so the controls are centred.
+  Q11 Leave tooltip.  Q12 single separator.  Q13 dark scrollbars in panels.
+  Q14 Restricted controls use aria-disabled (focusable, tooltip, no action) instead of disabled.
+  Q15 "Hand raised" badge on video tiles; webinar host fetches real names when an attendee's audience
+      room appears; an attendee's own name comes from its account or the guest name typed at join
+      (sessionStorage). A first attempt that sent attendees names from the server was reverted:
+      existing tests enforce that attendees receive no participant list.
+Dashboard (web/src/pages/DashboardPage.tsx; greeting() in lib/time.ts)
+  Hero with date, time-of-day greeting, "next up"/live summary, New meeting menu (instant / schedule),
+  inline join; 4 stat tiles; live banner only when live; main column Up next (date blocks, type,
+  recurring/password, Copy/Start) + Speaking time (2 shown, "Show all"); side column Personal room
+  + Recent recordings. No backend change.
+
+Tests (actual)
+  Backend ./mvnw verify: 202 run, 0 failures, 1 skipped.  Web: 240/240, ESLint 0 warnings.
+  Test changes: GridStage.test fixture gained raisedHands: {}; new greeting test in lib/time.test.ts;
+  live E2E harness accepts aria-disabled as "disabled" (Q14). Live E2E: 41/41.
+  Screenshots + measurements: no horizontal overflow at 390-1920; labels 11px, nothing clipped.
+
+Independent QA, round 2: Q1-Q15 and the dashboard PASS (two runs; evidence in session scratchpad
+qa-ui2\findings.md), except Q7 on phones (below).
+
+New QA findings (NOT FIXED - awaiting approval)
+  R1 Medium  Phone: opening a panel from the More menu leaves focus on the page body (not the panel).
+  R2 Low     Closing a panel with Escape does not return focus to its button.
+  R3 Low     Webinar tiles show the real name top-left but LiveKit's "Attendee" bottom-left.
+  R4 Low     Dashboard: a live instant meeting appears both in the Live banner and in Up next, and is
+             counted in the Upcoming tile.
+  Nits       "Meeting not found" page shows the raw code NOT_FOUND and a useless "Try again";
+             weak focus style on Up next title links; "1 unread messages" (plural);
+             Left/Right arrows don't move between emoji in the phone menu.
+
+Screen sharing question: the reported meetings were created as "Voice only", which hides camera
+and screen sharing by design. No change made (option A).

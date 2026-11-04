@@ -24,9 +24,13 @@ public final class SpeakerStatsDtos {
                                 @NotNull @Size(max = 300) List<@Valid @NotNull Entry> entries) {
     }
 
-    /** One participant's speaking time in a batch. A batch covers about 10 seconds; 30 s is the accepted maximum. */
+    /**
+     * One participant's speaking time in a batch. A batch covers about 10 seconds; 30 s is the accepted maximum.
+     * {@code longestTurnMs}: the longest single uninterrupted turn so far that is part of this batch (a turn still
+     * going counts from its start, even if it began in an earlier batch). Optional.
+     */
     public record Entry(@NotNull UUID participantId, @NotNull @Min(0) @Max(30_000) Long speakingMs,
-                        @NotNull @Min(0) @Max(100) Integer turns) {
+                        @NotNull @Min(0) @Max(100) Integer turns, @Min(0) @Max(3_600_000) Long longestTurnMs) {
     }
 
     public record SpeakerStat(UUID roomId, UUID participantId, String displayName, MeetingRole role,

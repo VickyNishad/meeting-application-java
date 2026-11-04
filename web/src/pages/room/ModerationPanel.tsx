@@ -1,25 +1,18 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, Circle, Loader2, MicOff, Square, UserCheck, X } from 'lucide-react';
+import { Check, Circle, Loader2, MicOff, Shield, Square, UserCheck, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Label, NativeSelect, Switch } from '@/components/ui/primitives';
+import { Avatar, Label, NativeSelect, Switch } from '@/components/ui/primitives';
 import { moderationApi, recordingsApi } from '@/lib/api/endpoints';
 import { errorMessage } from '@/lib/api/problem';
-import type { Recording, ScreenSharePolicy } from '@/lib/api/types';
+import type { MediaKindKey, Recording } from '@/lib/api/types';
 import { isRoomRecording, recordingSubject } from '@/lib/recordings';
 import { formatTime } from '@/lib/time';
 import { useMeetingRoom } from './roomContext';
-import { PanelChrome } from './PanelChrome';
+import { PanelChrome, PanelSection, SettingRow } from './PanelChrome';
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="border-b border-white/10 px-4 py-4">
-      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-neutral-400">{title}</h3>
-      {children}
-    </section>
-  );
-}
+const Section = PanelSection;
 
 function WaitingList() {
   const { meeting } = useMeetingRoom();
@@ -46,23 +39,24 @@ function WaitingList() {
 
   const waiting = q.data ?? [];
   return (
-    <Section title={`Waiting room (${waiting.length})`}>
+    <Section title={`Waiting room (${waiting.length})`} description="People asking to join wait here until a host admits them.">
       {q.isPending && <Loader2 className="size-4 animate-spin text-neutral-400" aria-label="Loading waiting room" />}
       {q.isError && <p className="text-sm text-red-300">{errorMessage(q.error)}</p>}
-      {q.data && waiting.length === 0 && <p className="text-sm text-neutral-400">No one is waiting.</p>}
+      {q.data && waiting.length === 0 && <p className="rounded-lg bg-white/[0.03] px-3 py-2.5 text-center text-sm text-neutral-400">No one is waiting.</p>}
       {waiting.length > 0 && (
         <>
-          <ul className="mb-3 space-y-2">
+          <ul className="mb-3 space-y-1.5">
             {waiting.map((w) => (
-              <li key={w.id} className="flex items-center gap-2 rounded-lg bg-white/5 px-3 py-2 text-sm">
-                <span className="min-w-0 flex-1 truncate">
+              <li key={w.id} className="flex items-center gap-2.5 rounded-lg border border-white/10 bg-white/5 py-1.5 pl-2 pr-1.5 text-sm">
+                <Avatar name={w.displayName} className="size-7 bg-white/10 text-[10px] text-neutral-100" />
+                <span className="min-w-0 flex-1 truncate font-medium">
                   {w.displayName}
-                  {w.role === 'GUEST' && <span className="ml-1 text-xs text-neutral-400">(guest)</span>}
+                  {w.role === 'GUEST' && <span className="ml-1 text-xs font-normal text-neutral-400">(guest)</span>}
                 </span>
-                <Button size="icon" variant="ghost" className="size-8 text-success hover:bg-white/10" aria-label={`Admit ${w.displayName}`} onClick={() => admit.mutate(w.id)} disabled={admit.isPending}>
+                <Button size="icon" variant="ghost" className="size-8 rounded-lg text-success hover:bg-success/15 hover:text-success" aria-label={`Admit ${w.displayName}`} onClick={() => admit.mutate(w.id)} disabled={admit.isPending}>
                   <Check aria-hidden="true" />
                 </Button>
-                <Button size="icon" variant="ghost" className="size-8 text-red-400 hover:bg-white/10" aria-label={`Deny ${w.displayName}`} onClick={() => deny.mutate(w.id)} disabled={deny.isPending}>
+                <Button size="icon" variant="ghost" className="size-8 rounded-lg text-red-400 hover:bg-red-500/15 hover:text-red-300" aria-label={`Deny ${w.displayName}`} onClick={() => deny.mutate(w.id)} disabled={deny.isPending}>
                   <X aria-hidden="true" />
                 </Button>
               </li>
@@ -116,7 +110,7 @@ function CloudRecording() {
   };
 
   return (
-    <Section title="Cloud recording">
+    <Section title="Cloud recording" description="Recorded on the server and saved to the recordings library.">
       {isOn ? (
         <div className="grid gap-2">
           <p className="flex items-center gap-2 text-sm">
@@ -198,9 +192,57 @@ function PersonRecordings({ recordings, onChanged }: { recordings: Recording[]; 
   );
 }
 
+const MEDIA_SWITCHES: { key: MediaKindKey; label: string; hint: string; video: boolean }[] = [
+  { key: 'microphone', label: 'Allow microphones', hint: 'Off: participants are muted and cannot unmute.', video: false },
+  { key: 'camera', label: 'Allow cameras', hint: 'Off: participants’ cameras are turned off and stay off.', video: true },
+  { key: 'screenShare', label: 'Allow screen sharing', hint: 'Off: only hosts and co-hosts can share.', video: true },
+];
+
+/**
+ * Meeting-wide media permissions for participants. The host changes them (the server enforces them on the media
+ * server and refuses anyone else); co-hosts see them. Per-participant exceptions are in the participants list.
+ */
+function MediaPermissionsSection() {
+  const { meeting, myRole, mediaPermissions, setMediaPermissions } = useMeetingRoom();
+  const [pending, setPending] = useState<MediaKindKey | null>(null);
+  const isHost = myRole === 'HOST';
+  const change = async (key: MediaKindKey, allowed: boolean, label: string) => {
+    setPending(key);
+    try {
+      setMediaPermissions(await moderationApi.mediaPermissions(meeting.id, { [key]: allowed ? 'ALLOWED' : 'RESTRICTED' }));
+      const what = label.replace('Allow ', '');
+      toast.success(`${what.charAt(0).toUpperCase()}${what.slice(1)}: ${allowed ? 'allowed for everyone' : 'restricted for participants'}`);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setPending(null);
+    }
+  };
+  return (
+    <Section title="Media permissions" description="What participants may use. Hosts and co-hosts always can.">
+      <div className="grid gap-4">
+        {MEDIA_SWITCHES.filter((s) => !s.video || meeting.mediaMode === 'VIDEO').map((s) => (
+          <SettingRow key={s.key} id={`mod-media-${s.key}`} label={s.label} hint={s.hint}>
+            <Switch
+              id={`mod-media-${s.key}`}
+              checked={mediaPermissions[s.key] === 'ALLOWED'}
+              disabled={!isHost || pending === s.key}
+              onCheckedChange={(v) => void change(s.key, v, s.label)}
+            />
+          </SettingRow>
+        ))}
+        <p className="rounded-lg bg-white/[0.03] px-3 py-2 text-xs leading-relaxed text-neutral-400">
+          {isHost
+            ? 'Allow or restrict individual participants from their menu in the participants list.'
+            : 'Only the host can change media permissions.'}
+        </p>
+      </div>
+    </Section>
+  );
+}
+
 export function ModerationPanel({ onClose }: { onClose: () => void }) {
-  const { meeting, locked, setLocked, screenSharePolicy, setScreenSharePolicy, waitingRoomEnabled, setWaitingRoomEnabled, chatEnabled, setChatEnabled } =
-    useMeetingRoom();
+  const { meeting, locked, setLocked, waitingRoomEnabled, setWaitingRoomEnabled, chatEnabled, setChatEnabled } = useMeetingRoom();
   const [pending, setPending] = useState<string | null>(null);
 
   const run = async (key: string, fn: () => Promise<unknown>, success: string) => {
@@ -218,64 +260,47 @@ export function ModerationPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <PanelChrome title="Host controls" onClose={onClose}>
-      <WaitingList />
-      <Section title="Audio">
-        <Button size="sm" variant="secondary" className="w-full" loading={pending === 'mute-all'} onClick={() => void run('mute-all', () => moderationApi.muteAll(meeting.id), 'Everyone was muted')}>
-          <MicOff aria-hidden="true" /> Mute everyone
-        </Button>
-        <p className="mt-2 text-xs text-neutral-400">Hosts and co-hosts are not muted. Participants unmute themselves.</p>
-      </Section>
-      <Section title="Meeting settings">
-        <div className="grid gap-4">
-          <div className="flex items-center justify-between gap-3">
-            <Label htmlFor="mod-lock">Lock meeting</Label>
-            <Switch
-              id="mod-lock"
-              checked={locked}
-              disabled={pending === 'lock'}
-              onCheckedChange={(v) => void run('lock', () => moderationApi.lock(meeting.id, v), v ? 'Meeting locked' : 'Meeting unlocked').then((ok) => ok && setLocked(v))}
-            />
+    <PanelChrome title="Host controls" icon={<Shield aria-hidden="true" />} onClose={onClose}>
+      <div className="space-y-3 p-3">
+        <WaitingList />
+        <Section title="Audio" description="Hosts and co-hosts are not muted. Participants may unmute again unless microphones are restricted below.">
+          <Button size="sm" variant="ghost" className="h-9 w-full rounded-lg border border-white/15 bg-white/5 text-neutral-100 hover:bg-white/10 hover:text-white" loading={pending === 'mute-all'} onClick={() => void run('mute-all', () => moderationApi.muteAll(meeting.id), 'Everyone was muted')}>
+            <MicOff aria-hidden="true" /> Mute everyone
+          </Button>
+        </Section>
+        <MediaPermissionsSection />
+        <Section title="Meeting settings">
+          <div className="grid gap-4">
+            <SettingRow id="mod-lock" label="Lock meeting" hint="New people cannot join until you unlock it.">
+              <Switch
+                id="mod-lock"
+                checked={locked}
+                disabled={pending === 'lock'}
+                onCheckedChange={(v) => void run('lock', () => moderationApi.lock(meeting.id, v), v ? 'Meeting locked' : 'Meeting unlocked').then((ok) => ok && setLocked(v))}
+              />
+            </SettingRow>
+            <SettingRow id="mod-waiting" label="Waiting room" hint="New people wait until a host admits them.">
+              <Switch
+                id="mod-waiting"
+                checked={waitingRoomEnabled}
+                disabled={pending === 'waiting'}
+                onCheckedChange={(v) =>
+                  void run('waiting', () => moderationApi.settings(meeting.id, { waitingRoomEnabled: v }), v ? 'Waiting room on' : 'Waiting room off').then((ok) => ok && setWaitingRoomEnabled(v))
+                }
+              />
+            </SettingRow>
+            <SettingRow id="mod-chat" label="Allow chat" hint="When off, participants cannot send chat messages.">
+              <Switch
+                id="mod-chat"
+                checked={chatEnabled}
+                disabled={pending === 'chat'}
+                onCheckedChange={(v) => void run('chat', () => moderationApi.settings(meeting.id, { chatEnabled: v }), v ? 'Chat enabled' : 'Chat disabled').then((ok) => ok && setChatEnabled(v))}
+              />
+            </SettingRow>
           </div>
-          <div className="flex items-center justify-between gap-3">
-            <Label htmlFor="mod-waiting">Waiting room</Label>
-            <Switch
-              id="mod-waiting"
-              checked={waitingRoomEnabled}
-              disabled={pending === 'waiting'}
-              onCheckedChange={(v) =>
-                void run('waiting', () => moderationApi.settings(meeting.id, { waitingRoomEnabled: v }), v ? 'Waiting room on' : 'Waiting room off').then((ok) => ok && setWaitingRoomEnabled(v))
-              }
-            />
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <Label htmlFor="mod-chat">Allow chat</Label>
-            <Switch
-              id="mod-chat"
-              checked={chatEnabled}
-              disabled={pending === 'chat'}
-              onCheckedChange={(v) => void run('chat', () => moderationApi.settings(meeting.id, { chatEnabled: v }), v ? 'Chat enabled' : 'Chat disabled').then((ok) => ok && setChatEnabled(v))}
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="mod-share">Who can share their screen</Label>
-            <NativeSelect
-              id="mod-share"
-              value={screenSharePolicy}
-              disabled={pending === 'share'}
-              className="border-white/15 bg-neutral-800"
-              onChange={(e) => {
-                const v = e.target.value as ScreenSharePolicy;
-                void run('share', () => moderationApi.settings(meeting.id, { screenSharePolicy: v }), 'Screen-sharing policy updated').then((ok) => ok && setScreenSharePolicy(v));
-              }}
-            >
-              <option value="EVERYONE">Everyone</option>
-              <option value="HOSTS_ONLY">Hosts and co-hosts only</option>
-            </NativeSelect>
-          </div>
-        </div>
-      </Section>
-      <CloudRecording />
+        </Section>
+        <CloudRecording />
+      </div>
     </PanelChrome>
   );
 }

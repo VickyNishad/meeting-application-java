@@ -236,3 +236,61 @@ describe('room state store: QA56 fixes', () => {
     expect(s.seq).toBe(3);
   });
 });
+
+describe('media permissions in the room state', () => {
+  const media = (participantId: string, mic: boolean, override: 'ALLOWED' | 'RESTRICTED' | null = null) => ({
+    participantId,
+    microphoneOverride: override,
+    cameraOverride: null,
+    screenShareOverride: null,
+    microphone: mic,
+    camera: true,
+    screenShare: true,
+  });
+
+  it('takes the meeting-wide permissions and the rights from the snapshot (own, and everyone for the host)', () => {
+    const s = loaded({
+      mediaPermissions: { microphone: 'RESTRICTED', camera: 'ALLOWED', screenShare: 'ALLOWED' },
+      myMedia: media('me', false),
+      participantMedia: [media('a', true, 'ALLOWED')],
+    });
+    expect(s.mediaPermissions.microphone).toBe('RESTRICTED');
+    expect(s.participantMedia.me?.microphone).toBe(false);
+    expect(s.participantMedia.a?.microphoneOverride).toBe('ALLOWED');
+  });
+
+  it('applies a numbered media-permissions signal, keeping the screen-sharing policy in step, and ignores a stale one', () => {
+    let s = loaded();
+    s = roomReducer(s, signal('moderation', { type: 'media-permissions', microphone: 'RESTRICTED', camera: 'ALLOWED', screenShare: 'RESTRICTED', stream: 'all', seq: 6 }));
+    expect(s.mediaPermissions).toEqual({ microphone: 'RESTRICTED', camera: 'ALLOWED', screenShare: 'RESTRICTED' });
+    expect(s.screenSharePolicy).toBe('HOSTS_ONLY');
+    // An older signal (out of order) does not undo it.
+    s = roomReducer(s, signal('moderation', { type: 'media-permissions', microphone: 'ALLOWED', camera: 'ALLOWED', screenShare: 'ALLOWED', stream: 'all', seq: 5 }));
+    expect(s.mediaPermissions.microphone).toBe('RESTRICTED');
+  });
+
+  it('ignores malformed media signals', () => {
+    let s = loaded();
+    s = roomReducer(s, signal('moderation', { type: 'media-permissions', microphone: 'MAYBE', camera: 'ALLOWED', screenShare: 'ALLOWED', stream: 'all', seq: 6 }));
+    expect(s.mediaPermissions.microphone).toBe('ALLOWED');
+    s = roomReducer(s, signal('moderation', { type: 'participant-media', participants: [{ participantId: 'x', microphone: 'yes' }] }));
+    expect(s.participantMedia.x).toBeUndefined();
+  });
+
+  it('merges participant-media signals and the host’s own changes', () => {
+    let s = loaded({ participantMedia: [media('a', true), media('b', true)] });
+    s = roomReducer(s, signal('moderation', { type: 'participant-media', participants: [media('a', false, 'RESTRICTED')] }));
+    expect(s.participantMedia.a?.microphone).toBe(false);
+    expect(s.participantMedia.b?.microphone).toBe(true);
+    s = roomReducer(s, { type: 'participant-media', media: media('b', false, 'RESTRICTED') });
+    expect(s.participantMedia.b?.microphoneOverride).toBe('RESTRICTED');
+  });
+
+  it('keeps the screen-sharing permission and policy as one setting when the host changes either', () => {
+    let s = loaded();
+    s = roomReducer(s, { type: 'patch', patch: { mediaPermissions: { microphone: 'ALLOWED', camera: 'ALLOWED', screenShare: 'RESTRICTED' } } });
+    expect(s.screenSharePolicy).toBe('HOSTS_ONLY');
+    s = roomReducer(s, { type: 'patch', patch: { screenSharePolicy: 'EVERYONE' } });
+    expect(s.mediaPermissions.screenShare).toBe('ALLOWED');
+  });
+});

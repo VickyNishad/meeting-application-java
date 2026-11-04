@@ -1,5 +1,6 @@
 package com.example.meetplatform.participant.dto;
 
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
 import com.example.meetplatform.meeting.entity.MeetingEnums.ScreenSharePolicy;
 import com.example.meetplatform.meeting.entity.MeetingEnums.VisibilityMode;
@@ -34,7 +35,21 @@ public final class RoomStateDtos {
                                 boolean chatEnabled, ScreenSharePolicy screenSharePolicy, boolean waitingRoomEnabled,
                                 boolean cloudRecording, boolean autoRecord, List<Actor> localRecorders,
                                 List<Actor> raisedHands, Integer waitingCount, List<Actor> participants,
-                                int presentCount) {
+                                int presentCount, MediaPermissionsView mediaPermissions, ParticipantMedia myMedia,
+                                List<ParticipantMedia> participantMedia) {
+    }
+
+    /** The meeting-wide media permissions for participants (hosts and co-hosts may always publish). */
+    public record MediaPermissionsView(MediaPermission microphone, MediaPermission camera, MediaPermission screenShare) {
+    }
+
+    /**
+     * One participant's media rights: the host's overrides (null = follows the meeting) and what it may publish now.
+     * Everyone gets their own ({@code myMedia}); only the host gets everyone's ({@code participantMedia}).
+     */
+    public record ParticipantMedia(String participantId, MediaPermission microphoneOverride, MediaPermission cameraOverride,
+                                   MediaPermission screenShareOverride, boolean microphone, boolean camera,
+                                   boolean screenShare) {
     }
 
     /** A participant doing something (recording locally, hand raised) since {@code since}. */

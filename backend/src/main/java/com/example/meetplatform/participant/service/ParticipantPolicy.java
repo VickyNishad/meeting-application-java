@@ -9,8 +9,11 @@ import com.example.meetplatform.media.service.RoomNames;
 import com.example.meetplatform.meeting.entity.Meeting;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MediaMode;
 import com.example.meetplatform.meeting.entity.MeetingEnums.MeetingRole;
-import com.example.meetplatform.meeting.entity.MeetingEnums.ScreenSharePolicy;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaKind;
+import com.example.meetplatform.meeting.entity.MeetingEnums.MediaPermission;
 import com.example.meetplatform.meeting.service.MeetingPermissions;
+import com.example.meetplatform.participant.dto.RoomStateDtos.MediaPermissionsView;
+import com.example.meetplatform.participant.dto.RoomStateDtos.ParticipantMedia;
 import com.example.meetplatform.participant.entity.MeetingParticipant;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
@@ -53,11 +56,11 @@ public class ParticipantPolicy {
      * Permissions in the session's stage room. In HOST_AND_SELF_ONLY an attendee only watches the stage there: it may
      * subscribe, may not publish, and is hidden from everyone else in that room.
      */
-    public MediaPermissions permissionsFor(Meeting meeting, MeetingRole role) {
-        if (meeting.isStageOnly() && !role.isModerator()) {
+    public MediaPermissions permissionsFor(Meeting meeting, MeetingParticipant participant) {
+        if (meeting.isStageOnly() && !participant.getRole().isModerator()) {
             return new MediaPermissions(true, false, EnumSet.noneOf(TrackSource.class), true);
         }
-        return new MediaPermissions(true, false, publishSources(meeting, role));
+        return new MediaPermissions(true, false, publishSources(meeting, participant));
     }
 
     /**
@@ -65,21 +68,61 @@ public class ParticipantPolicy {
      * to anything, so no attendee can receive another attendee's media; the stage subscribes (hidden, publishing
      * nothing there) and so sees and hears every attendee.
      */
-    public MediaPermissions audiencePermissionsFor(Meeting meeting, MeetingRole role) {
-        if (role.isModerator()) {
+    public MediaPermissions audiencePermissionsFor(Meeting meeting, MeetingParticipant participant) {
+        if (participant.getRole().isModerator()) {
             return new MediaPermissions(true, false, EnumSet.noneOf(TrackSource.class), true);
         }
-        return new MediaPermissions(false, false, publishSources(meeting, role));
+        return new MediaPermissions(false, false, publishSources(meeting, participant));
     }
 
-    private Set<TrackSource> publishSources(Meeting meeting, MeetingRole role) {
-        Set<TrackSource> sources = EnumSet.of(TrackSource.MICROPHONE);
-        if (meeting.getMediaMode() == MediaMode.VIDEO) {
+    /**
+     * Whether the participant may publish this medium, the one rule behind every token and live grant update:
+     * <ol>
+     *   <li>camera and screen sharing exist only in video meetings;</li>
+     *   <li>hosts and co-hosts always may (screen sharing also: any role granted MEETING_SCREEN_SHARE);</li>
+     *   <li>otherwise the host's override for this participant, if any;</li>
+     *   <li>otherwise the meeting's permission; anything missing counts as restricted.</li>
+     * </ol>
+     */
+    public boolean mayPublish(Meeting meeting, MeetingParticipant participant, MediaKind kind) {
+        if (kind != MediaKind.MICROPHONE && meeting.getMediaMode() != MediaMode.VIDEO) {
+            return false;
+        }
+        MeetingRole role = participant.getRole();
+        if (role.isModerator() || (kind == MediaKind.SCREEN_SHARE && permissions.has(role, MeetingPermissions.SCREEN_SHARE))) {
+            return true;
+        }
+        MediaPermission override = participant.getMediaOverride(kind);
+        MediaPermission effective = override != null ? override : meeting.getMediaPermission(kind);
+        return effective == MediaPermission.ALLOWED;
+    }
+
+    public MediaPermissionsView mediaPermissions(Meeting meeting) {
+        return new MediaPermissionsView(meeting.getMediaPermission(MediaKind.MICROPHONE),
+                meeting.getMediaPermission(MediaKind.CAMERA), meeting.getMediaPermission(MediaKind.SCREEN_SHARE));
+    }
+
+    public ParticipantMedia participantMedia(Meeting meeting, MeetingParticipant participant) {
+        return new ParticipantMedia(participant.getId().toString(), participant.getMediaOverride(MediaKind.MICROPHONE),
+                participant.getMediaOverride(MediaKind.CAMERA), participant.getMediaOverride(MediaKind.SCREEN_SHARE),
+                mayPublish(meeting, participant, MediaKind.MICROPHONE), mayPublish(meeting, participant, MediaKind.CAMERA),
+                mayPublish(meeting, participant, MediaKind.SCREEN_SHARE));
+    }
+
+    private Set<TrackSource> publishSources(Meeting meeting, MeetingParticipant participant) {
+        Set<TrackSource> sources = EnumSet.noneOf(TrackSource.class);
+        boolean microphone = mayPublish(meeting, participant, MediaKind.MICROPHONE);
+        if (microphone) {
+            sources.add(TrackSource.MICROPHONE);
+        }
+        if (mayPublish(meeting, participant, MediaKind.CAMERA)) {
             sources.add(TrackSource.CAMERA);
-            boolean mayShare = meeting.getScreenSharePolicy() == ScreenSharePolicy.EVERYONE
-                    || permissions.has(role, MeetingPermissions.SCREEN_SHARE);
-            if (mayShare) {
-                sources.add(TrackSource.SCREEN_SHARE);
+        }
+        if (mayPublish(meeting, participant, MediaKind.SCREEN_SHARE)) {
+            sources.add(TrackSource.SCREEN_SHARE);
+            // The SFU cannot tell what an audio track carries: screen-share audio could be a microphone in disguise, so
+            // it also needs the microphone permission.
+            if (microphone) {
                 sources.add(TrackSource.SCREEN_SHARE_AUDIO);
             }
         }
@@ -120,7 +163,7 @@ public class ParticipantPolicy {
             return List.of(ownAudienceRoom(meeting, viewer, stageRoom));
         }
         String metadata = metadataFor(meeting, viewer);
-        MediaPermissions watcher = audiencePermissionsFor(meeting, viewer.getRole());
+        MediaPermissions watcher = audiencePermissionsFor(meeting, viewer);
         return present.stream()
                 .filter(p -> isMasked(meeting, p.getRole()))
                 .map(p -> {
@@ -137,7 +180,7 @@ public class ParticipantPolicy {
         media.createRoom(room, 1);
         String token = media.issueToken(new MediaTokenRequest(room, attendee.getId().toString(),
                 visibleName(meeting, attendee), metadataFor(meeting, attendee),
-                audiencePermissionsFor(meeting, attendee.getRole()), props.tokenTtl()));
+                audiencePermissionsFor(meeting, attendee), props.tokenTtl()));
         return new AudienceRoom(attendee.getId(), room, token);
     }
 
@@ -163,6 +206,6 @@ public class ParticipantPolicy {
     public String issueToken(Meeting meeting, MeetingParticipant participant, String roomName) {
         return media.issueToken(new MediaTokenRequest(roomName, participant.getId().toString(),
                 visibleName(meeting, participant), metadataFor(meeting, participant),
-                permissionsFor(meeting, participant.getRole()), props.tokenTtl()));
+                permissionsFor(meeting, participant), props.tokenTtl()));
     }
 }

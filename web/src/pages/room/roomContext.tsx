@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { JoinResponse, Meeting, MeetingRole, ScreenSharePolicy } from '@/lib/api/types';
+import type { JoinResponse, MediaPermissions, Meeting, MeetingRole, ParticipantMedia, ScreenSharePolicy } from '@/lib/api/types';
 import type { Room } from 'livekit-client';
 
 export type EndReason = 'left' | 'ended' | 'removed';
@@ -40,6 +40,12 @@ export interface MeetingRoomState {
    * Empty otherwise.
    */
   audienceRooms: Room[];
+  /** Meeting-wide media permissions for participants (hosts and co-hosts always may publish). */
+  mediaPermissions: MediaPermissions;
+  setMediaPermissions: (p: MediaPermissions) => void;
+  /** Media rights by participant id: everyone's for the host, otherwise one's own. */
+  participantMedia: Record<string, ParticipantMedia>;
+  setParticipantMedia: (m: ParticipantMedia) => void;
   finish: (reason: EndReason) => void;
 }
 

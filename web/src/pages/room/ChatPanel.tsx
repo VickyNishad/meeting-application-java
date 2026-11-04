@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Download, FileUp, Loader2, Paperclip, Send } from 'lucide-react';
+import { Download, FileUp, Loader2, MessageSquare, Paperclip, Send } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/primitives';
+import { Avatar, Input } from '@/components/ui/primitives';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/overlays';
 import { chatApi } from '@/lib/api/endpoints';
 import { errorMessage } from '@/lib/api/problem';
@@ -44,7 +44,7 @@ function Messages({ chat }: { chat: MeetingChat }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4" role="log" aria-live="polite" aria-label="Chat messages">
+      <div className="min-h-0 flex-1 overflow-y-auto p-4" role="log" aria-live="polite" aria-label="Chat messages">
         {chat.loading && <Loader2 className="mx-auto size-5 animate-spin text-neutral-400" aria-label="Loading messages" />}
         {chat.error != null && (
           <div className="text-sm text-red-300" role="alert">
@@ -54,18 +54,38 @@ function Messages({ chat }: { chat: MeetingChat }) {
             </button>
           </div>
         )}
-        {!chat.loading && chat.messages.length === 0 && !chat.error && <p className="text-center text-sm text-neutral-400">No messages yet. Say hi 👋</p>}
-        {chat.messages.map((m) => {
+        {!chat.loading && chat.messages.length === 0 && !chat.error && (
+          <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-neutral-400">
+            <MessageSquare className="size-8 text-neutral-600" aria-hidden="true" />
+            No messages yet. Say hi 👋
+          </div>
+        )}
+        {chat.messages.map((m, i) => {
           const mine = m.participantId === join.participantId;
+          // Consecutive messages from one sender form a group: name, avatar and time once, at its start.
+          const prev = chat.messages[i - 1];
+          const first = !prev || prev.participantId !== m.participantId || prev.audience !== m.audience;
           return (
-            <div key={m.id} className={cn('flex flex-col', mine ? 'items-end' : 'items-start')}>
-              <span className="text-[11px] text-neutral-400">
-                {mine ? 'You' : m.senderName} · {formatTime(m.sentAt)}
-                {m.audience === 'STAGE' && <span className="ml-1 rounded bg-white/10 px-1">to hosts</span>}
-              </span>
-              <p className={cn('mt-0.5 max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-3 py-2 text-sm', mine ? 'bg-primary text-primary-foreground' : 'bg-white/10')}>
-                {m.text}
-              </p>
+            <div key={m.id} className={cn('flex gap-2', mine ? 'justify-end' : 'justify-start', first ? 'mt-3 first:mt-0' : 'mt-1')}>
+              {!mine && (first ? <Avatar name={m.senderName} className="mt-5 size-7 bg-white/10 text-[10px] text-neutral-100" /> : <span className="w-7 shrink-0" aria-hidden="true" />)}
+              <div className={cn('flex min-w-0 max-w-[80%] flex-col', mine ? 'items-end' : 'items-start')}>
+                {first && (
+                  <span className="mb-1 flex items-center gap-1.5 text-[11px] text-neutral-400">
+                    <span className="font-semibold text-neutral-200">{mine ? 'You' : m.senderName}</span>
+                    {formatTime(m.sentAt)}
+                    {m.audience === 'STAGE' && <span className="rounded bg-white/10 px-1 text-neutral-300">to hosts</span>}
+                  </span>
+                )}
+                <p
+                  className={cn(
+                    'max-w-full whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-relaxed [overflow-wrap:anywhere]',
+                    mine ? 'rounded-br-md bg-primary text-primary-foreground' : 'rounded-bl-md bg-white/10 text-neutral-100',
+                  )}
+                  title={first ? undefined : formatTime(m.sentAt)}
+                >
+                  {m.text}
+                </p>
+              </div>
             </div>
           );
         })}
@@ -90,7 +110,7 @@ function Messages({ chat }: { chat: MeetingChat }) {
             Message
           </label>
           <Input id="chat-input" className={darkInput} value={text} maxLength={4000} placeholder={canSend ? 'Send a message' : 'Chat is disabled'} disabled={!canSend} onChange={(e) => setText(e.target.value)} autoComplete="off" />
-          <Button type="submit" size="icon" aria-label="Send message" loading={sending} disabled={!canSend || !text.trim()}>
+          <Button type="submit" size="icon" className="size-10 shrink-0 rounded-lg" aria-label="Send message" loading={sending} disabled={!canSend || !text.trim()}>
             {!sending && <Send aria-hidden="true" />}
           </Button>
         </div>
@@ -164,9 +184,9 @@ function Files() {
 
 export function ChatPanel({ chat, onClose }: { chat: MeetingChat; onClose: () => void }) {
   return (
-    <PanelChrome title="Chat" onClose={onClose}>
+    <PanelChrome title="Chat" icon={<MessageSquare aria-hidden="true" />} onClose={onClose}>
       <Tabs defaultValue="messages" className="flex h-full flex-col">
-        <TabsList className="mx-4 mt-3 grid grid-cols-2 bg-white/10 text-neutral-300">
+        <TabsList className="mx-4 mt-3 grid h-9 grid-cols-2 rounded-lg bg-white/5 p-1 text-neutral-300">
           <TabsTrigger value="messages" className="data-[state=active]:bg-neutral-700 data-[state=active]:text-white">
             Messages
           </TabsTrigger>

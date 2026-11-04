@@ -31,6 +31,10 @@ public interface RecordingRepository extends JpaRepository<Recording, UUID> {
 
     boolean existsByRoomIdAndKindAndAutoSuppressedTrue(UUID roomId, String kind);
 
+    /** An automatic recording of this room failed recently (it is not retried on every bit of speech). */
+    boolean existsByRoomIdAndKindAndAutoStartedTrueAndStatusAndCreatedAtAfter(UUID roomId, String kind,
+                                                                             Recording.Status status, Instant after);
+
     boolean existsByParticipantIdAndAutoSuppressedTrue(UUID participantId);
 
     /** Auto-record was switched on again: recordings a moderator stopped may be started again. */
