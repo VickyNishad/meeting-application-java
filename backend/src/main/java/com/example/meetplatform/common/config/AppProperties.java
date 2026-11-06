@@ -61,20 +61,33 @@ public record AppProperties(
     }
 
     public record Storage(
-            @NotBlank String endpoint,
-            @NotBlank String publicEndpoint,
-            @NotBlank String accessKey,
-            @NotBlank String secretKey,
+            // Empty: AWS S3 in "region". Set: an S3-compatible server (needs accessKey and secretKey).
+            String endpoint,
+            // The host browsers reach for presigned URLs. Empty: the same as endpoint.
+            String publicEndpoint,
+            // Empty: the server's IAM role (AWS S3 only).
+            String accessKey,
+            String secretKey,
             @NotBlank String region,
             @NotBlank String recordingsBucket,
             @NotBlank String filesBucket,
             @NotNull Duration presignTtl,
-            // "s3" (default) or "local": the "dev" profile keeps objects on this machine's disk under localRoot
+            // STORAGE_PROVIDER: "s3" (default) or "local" (this machine's disk under localRoot)
             @NotBlank String type,
             String localRoot) {
+
+        public Storage {
+            if (type == null || !(type.equalsIgnoreCase("s3") || type.equalsIgnoreCase("local"))) {
+                throw new IllegalArgumentException("STORAGE_PROVIDER must be local or s3, not '" + type + "'");
+            }
+        }
     }
 
-    public record Recording(@Min(1) int defaultRetentionDays, @NotBlank String filePrefix) {
+    /**
+     * {@code cloudEnabled}: whether whole-meeting recording (LiveKit Egress) may be started. Off unless a recorder has
+     * been deployed: without one, every attempt would only leave a failed entry. Speaking clips do not depend on it.
+     */
+    public record Recording(@Min(1) int defaultRetentionDays, @NotBlank String filePrefix, boolean cloudEnabled) {
     }
 
     public record RateLimit(boolean enabled) {

@@ -34,7 +34,7 @@ class LocalFileObjectStorageTest {
 
         storage.put("meet-recordings", "recordings/m1/r1.mp4", new ByteArrayInputStream(body), body.length, "video/mp4");
 
-        Path stored = root.resolve("meet-recordings/recordings/m1/r1.mp4");
+        Path stored = root.resolve("meeting-recordings/recordings/m1/r1.mp4");
         assertThat(stored).hasBinaryContent(body);
         assertThat(Files.list(stored.getParent())).containsExactly(stored);
 
@@ -72,7 +72,7 @@ class LocalFileObjectStorageTest {
     @Test
     void keysCannotEscapeTheirBucketFolder() {
         LocalFileObjectStorage storage = storage(root.toString(), NOW);
-        for (String key : List.of("../meet-files/x", "../../outside.txt", "a/../../x", "", " ")) {
+        for (String key : List.of("../shared-files/x", "../../outside.txt", "a/../../x", "", " ")) {
             assertThatThrownBy(() -> storage.put("meet-recordings", key, new ByteArrayInputStream(new byte[0]), 0, null))
                     .as(key).isInstanceOf(ApiException.class);
         }
@@ -89,14 +89,14 @@ class LocalFileObjectStorageTest {
         storage.delete("meet-files", "f/1.txt");
         storage.delete("meet-files", "f/1.txt");
 
-        assertThat(root.resolve("meet-files/f/1.txt")).doesNotExist();
+        assertThat(root.resolve("shared-files/f/1.txt")).doesNotExist();
     }
 
     @Test
     void createsBucketFoldersAndRequiresARoot() {
         storage(root.resolve("meetly").toString(), NOW);
-        assertThat(root.resolve("meetly/meet-recordings")).isDirectory();
-        assertThat(root.resolve("meetly/meet-files")).isDirectory();
+        assertThat(root.resolve("meetly/meeting-recordings")).isDirectory();
+        assertThat(root.resolve("meetly/shared-files")).isDirectory();
 
         assertThatThrownBy(() -> storage("", NOW)).isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> storage(null, NOW)).isInstanceOf(IllegalStateException.class);

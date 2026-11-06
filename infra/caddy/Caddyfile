@@ -7,7 +7,7 @@
 #   APP_CORS_ALLOWED_ORIGINS=https://meet.example.com
 #   APP_CALENDAR_CALLBACK_BASE_URL=https://meet.example.com
 #   LIVEKIT_PUBLIC_URL=wss://meet.example.com
-#   S3_PUBLIC_ENDPOINT=https://s3.meet.example.com
+#   S3_PUBLIC_ENDPOINT=https://s3.meet.example.com   (MinIO only; must stay empty with AWS S3, whose links need no proxy)
 
 {$SITE_DOMAIN} {
 	encode zstd gzip

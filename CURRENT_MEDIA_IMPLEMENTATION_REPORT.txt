@@ -1,0 +1,442 @@
+MEETLY - CURRENT MEDIA IMPLEMENTATION REPORT
+Report date: 2026-11-05
+Source inspected: commit 71ca2d3 (branch main). No source file, dependency or configuration was changed.
+Versions: LiveKit server v1.13.11, LiveKit Egress v1.15.0, livekit-client 2.15.5, @livekit/components-react 2.9.14,
+          @livekit/components-styles 1.1.6, @sapphi-red/web-noise-suppressor 0.4.1, React 19.1.1
+
+HOW TO READ THE EVIDENCE LABELS
+  [CODE]   Verified by reading the source or configuration named next to it.
+  [RUN]    Verified from actual behaviour: logs, database, or tests run on this project.
+  [LIB]    Verified by reading the library or Docker image, not your code.
+  [INFER]  A conclusion drawn from verified facts. Not directly proven.
+  [UNVERIFIED]  Not tested. Treat as unknown.
+
+PATH SHORTCUTS
+  B/ = backend/src/main/java/com/example/meetplatform/
+  W/ = web/src/
+
+SUMMARY
+  - The browser talks to LiveKit directly. The Java backend never touches media. It decides who may do what, signs
+    tokens, and pushes changed permissions to LiveKit.
+  - Host permissions are enforced by the LiveKit server, not by the browser.
+  - Speaking clips are recorded in each participant's browser and uploaded to the backend in chunks.
+  - Whole-meeting cloud recording uses LiveKit Egress. It has never worked in this environment.
+  - ROOT CAUSE OF ITEM 11 (see section 11): the recorder's browser runs in its own container, but LiveKit tells it to
+    send media to 127.0.0.1 (LIVEKIT_NODE_IP=127.0.0.1). Inside that container, 127.0.0.1 is the container itself, so
+    the media connection always fails. The mechanism is proven from logs. A fix has NOT been tried.
+
+
+==========================================================================================
+1. HOW LIVEKIT IS INTEGRATED WITH THE REACT FRONTEND
+==========================================================================================
+[CODE] Connection: W/pages/room/MeetingRoomPage.tsx
+  - Default export MeetingRoomPage renders <LiveKitRoom> (line 349) with serverUrl={join.livekitUrl},
+    token={join.token}, connect={!connectError}, audio, video, options.
+  - Both URL and token come from the backend join response, never from frontend configuration.
+  - Callbacks: onConnected, onError, onMediaDeviceFailure, onDisconnected. onDisconnected turns the disconnect reason
+    into the correct screen (PARTICIPANT_REMOVED, ROOM_DELETED, DUPLICATE_IDENTITY).
+  - Styles: import '@livekit/components-styles' (line 6).
+
+[CODE] Room options: MeetingRoomPage.tsx lines 340-346
+    adaptiveStream: true
+    dynacast: true
+    audioCaptureDefaults: { deviceId, echoCancellation: true, noiseSuppression: true }
+    videoCaptureDefaults: { deviceId, resolution 1280x720 at 30 fps }
+    audioOutput: chosen device, if any
+
+[CODE] Room UI: W/pages/room/RoomView.tsx. Uses useRoomContext, useTracks, GridLayout, FocusLayoutContainer,
+  CarouselLayout, ParticipantTile, RoomAudioRenderer, ConnectionStateToast, useDataChannel.
+
+[CODE] Server-to-client signals: RoomView.tsx lines 669-721 use useDataChannel on these topics: moderation, recording,
+  chat, presence, files, and more. isFromServer() (W/pages/room/roomData.ts:64) accepts only messages with no sending
+  participant. Participants have canPublishData=false, so clients cannot forge these messages.
+
+[CODE] Backend connection: B/media/adapter/livekit/LiveKitMediaAdapter.java implements the MediaService interface
+  (B/media/service/MediaService.java). Uses the LiveKit server SDK: RoomServiceClient, EgressServiceClient,
+  WebhookReceiver, AccessToken.
+
+[CODE] Configuration
+  - docker-compose.yml, livekit service: LIVEKIT_CONFIG block (ports, RTC range, node_ip, TURN, Redis, keys, webhook,
+    room timeouts, audio detection).
+  - backend/src/main/resources/application.yml lines 137-144: public-url, api-url, api-key, api-secret,
+    token-ttl 10m, empty-room-timeout-seconds 300, request-timeout 10s.
+  - B/common/config/AppProperties.java: record LiveKit (line 53).
+  - web/nginx.conf line 98: CSP allows the ws:/wss: connections.
+
+
+==========================================================================================
+2. HOW THE JAVA BACKEND GENERATES AND VALIDATES LIVEKIT TOKENS
+==========================================================================================
+GENERATION
+[CODE] LiveKitMediaAdapter.issueToken(MediaTokenRequest), line 94. Uses AccessToken and sets:
+    identity = participant id (UUID)
+    name     = visible name ("Attendee" for masked webinar attendees)
+    metadata = JSON with role, and userId when not masked (ParticipantPolicy.metadataFor, line 197)
+    ttl      = 10 minutes (app.livekit.token-ttl)
+    grants   = RoomJoin(true), RoomName, CanSubscribe, CanPublish, CanPublishData, CanPublishSources,
+               CanUpdateOwnMetadata(false), and Hidden(true) when hidden
+
+[CODE] Rights come only from the server: B/participant/service/ParticipantPolicy.java
+    permissionsFor (59), audiencePermissionsFor (71), mayPublish (87), issueAccess (143), issueToken (206).
+    The class comment states clients never choose these. canPublish is derived from the sources list:
+    B/media/dto/MediaPermissions.java, canPublish() returns !publishSources.isEmpty().
+
+[CODE] When tokens are issued
+    POST /api/v1/meetings/{id}/join          JoinService.join (95) -> response (332) -> policy.issueAccess
+    GET  /api/v1/meetings/{id}/join-status   JoinService.status (186), used by a page refresh (ResumeJoin in
+                                             MeetingRoomPage.tsx line 75)
+    GET  /api/v1/meetings/{id}/audience-access  RoomStateService.audienceAccess (webinar audience rooms)
+
+VALIDATION: IMPORTANT DISTINCTION
+[CODE] The backend does NOT validate LiveKit access tokens. It only signs them.
+[INFER] The LiveKit server validates them, using the keys in LIVEKIT_CONFIG. This is standard LiveKit behaviour and
+        matches observed rejections, but the validation code was not read.
+
+[CODE] What the backend does validate
+  - Who may receive a token: JoinService.join checks meeting state, access, password, lock and capacity. A waiting
+    participant gets no token (JoinService.response issues one only if present and a room exists).
+  - The caller of participant APIs: ParticipantAccessService.resolve (57) and resolvePresent (71), using the sign-in
+    or the participant secret (X-Participant-Token).
+  - Webhooks from LiveKit: LiveKitMediaAdapter.parseWebhook (235) uses WebhookReceiver.receive to check the signature.
+    Missing or invalid signature gives WEBHOOK_SIGNATURE_INVALID.
+
+[CODE] Stale tokens are still controlled. A token stays valid for 10 minutes, so on each confirmed connection the
+  backend pushes current rights (ParticipantLifecycleService.applyCurrentGrants, 275) or ejects people who are no
+  longer allowed (onMediaEvent, 174).
+
+[UNVERIFIED] Exact client behaviour when the token expires during a long connected meeting. The client caches a token
+  for 4 minutes (W/lib/joinStore.ts, FRESH_MS) and re-fetches via join-status. LiveKit's own refresh during a session
+  was not traced.
+
+
+==========================================================================================
+3. HOW PARTICIPANTS JOIN AND LEAVE LIVEKIT ROOMS
+==========================================================================================
+JOIN
+[CODE] 1. W/pages/room/JoinFlow.tsx calls meetingsApi.join.
+[CODE] 2. B/participant/controller/ParticipantController.java (POST /join, line 48) -> JoinService.join (95).
+[CODE] 3. Meeting row locked with findByIdForUpdate. First host/allowed joiner starts the session:
+          RoomSessionService.start (B/room/service/RoomSessionService.java, 77) names the room
+          "mtg-<meetingId>-<random>", calls media.createRoom (adapter line 80, capacity + 10 headroom), then saves it.
+[CODE] 4. Participant saved as ADMITTED, or WAITING (waiting room / host absent). Guests may prove an earlier
+          participation with rejoin data (provenGuestParticipation, 287).
+[CODE] 5. Browser connects to LiveKit with the token.
+[CODE] 6. LiveKit sends a webhook: B/media/webhook/LiveKitWebhookController.java (line 24) -> MediaWebhookService.handle
+          (40), which removes duplicates, then publishes MediaWebhookEvent.
+[CODE] 7. ParticipantLifecycleService.onMediaEvent (174) takes the meeting row lock, then markConnected (381) sets JOINED.
+          Presence comes from the SFU, not from the client.
+
+LEAVE
+[CODE] Normal leave: POST /leave -> ParticipantLifecycleService.leave (97). The browser then disconnects
+       (LeaveDialog in W/pages/room/ControlBar.tsx).
+[CODE] Connection lost: participant_left webhook -> disconnected (291) marks LEFT, ignores old connections, clears raised
+       hand and local recording state, and starts host succession after a grace period (scheduleSuccession).
+[CODE] Removed by host: ModerationService.remove (244) -> media.removeParticipant (adapter 143).
+[CODE] End meeting: POST /end -> lifecycle end (122) -> RoomSessionService.end (102) signals "meeting-ended", closes the
+       room. onSessionEnded deletes webinar audience rooms.
+[CODE] A LEFT participant reconnecting with a still-valid token is re-checked (reconnectRefusal); a REMOVED, DENIED or
+       WAITING one is ejected at once.
+[CODE] Room timeouts: empty_timeout 300 s, departure_timeout 20 s (docker-compose.yml).
+
+
+==========================================================================================
+4. HOW MICROPHONE AND CAMERA STREAMS ARE PUBLISHED
+==========================================================================================
+[CODE] On connect, in normal meetings: <LiveKitRoom audio={wantAudio} video={wantVideo}> (MeetingRoomPage.tsx 355-356)
+       publishes from the pre-join choice. wantVideo is false in audio-only meetings. startMuted (line 333) applies
+       the meeting's muteOnEntry to non-moderators.
+[CODE] In the meeting: ControlBar.tsx toggle() calls localParticipant.setMicrophoneEnabled (497) and
+       setCameraEnabled (515).
+[CODE] Webinar attendees publish nothing in the stage room (audio/video false). Their media goes to their own audience
+       room: W/pages/room/useAudienceRoom.ts, useAudienceRooms (19), setMicrophoneEnabled/setCameraEnabled (85-86).
+[CODE] A host "ask to unmute" never unmutes remotely. It shows UnmuteRequestDialog (RoomView.tsx 361). The participant
+       must accept.
+[LIB]  publishDefaults is not set in your code, so livekit-client defaults apply, including simulcast: true and
+       autoGainControl: true (livekit-client.esm.mjs lines 15384 and 15395).
+[RUN]  Publishing confirmed by the live test (41/41) using LiveKit's own participant list.
+
+
+==========================================================================================
+5. HOW PARTICIPANTS SUBSCRIBE TO OTHER PARTICIPANTS' STREAMS
+==========================================================================================
+[LIB]  autoSubscribe defaults to true in livekit-client (line 15415), and your code does not change it. So every
+       participant subscribes automatically to whatever LiveKit allows.
+[CODE] Video display: RoomView.tsx, Stage (256) uses useTracks (262) for Camera (with placeholder) and ScreenShare.
+       GridStage (299) renders GridLayout; speaker view uses FocusLayoutContainer and CarouselLayout.
+[CODE] Audio playback: <RoomAudioRenderer /> (RoomView.tsx 929). For moderators there is one more per audience room
+       (around 932).
+[CODE] adaptiveStream and dynacast reduce bandwidth for video that is small or unseen.
+
+WEBINARS (HOST_AND_SELF_ONLY) USE SEPARATE ROOMS TO ENFORCE PRIVACY
+[CODE] ParticipantPolicy.permissionsFor (59): attendee in the stage room may subscribe, may not publish, and is hidden.
+[CODE] ParticipantPolicy.audiencePermissionsFor (71): attendee in its own audience room may publish but NOT subscribe.
+       Moderators in that room may subscribe, publish nothing, and are hidden.
+[CODE] Result: an attendee sees the stage only. Hosts join every attendee room and show them through useAudienceTiles
+       (RoomView.tsx 186). Room names: B/media/service/RoomNames.java.
+[CODE] Attendees are named "Attendee" on the SFU. Hosts get real names from room-state.
+
+
+==========================================================================================
+6. HOW SCREEN SHARING WORKS
+==========================================================================================
+[CODE] Start: ControlBar.tsx line 441-442, toggleShare calls
+       localParticipant.setScreenShareEnabled(on, { audio: rights.microphone, selfBrowserSurface: 'exclude' }).
+[CODE] Screen audio is requested only when the microphone is allowed.
+[CODE] Receiving: same useTracks path as section 5. Speaker view shows the share in the focus area (RoomView.tsx 282).
+[CODE] Right to share: ParticipantPolicy.mayPublish (87) with kind SCREEN_SHARE. Screen sharing exists only in VIDEO
+       meetings: mayPublish returns false for camera and screen in AUDIO_ONLY meetings. This is why Voice-only meetings
+       show no Share button.
+[CODE] SCREEN_SHARE_AUDIO is granted only when both screen share and microphone are allowed (ParticipantPolicy
+       publishSources), because the SFU cannot tell what an audio track contains.
+[CODE] The meeting setting IS the existing screenSharePolicy: EVERYONE = ALLOWED, HOSTS_ONLY = RESTRICTED
+       (B/meeting/entity/Meeting.java, getMediaPermission).
+[CODE] A host can stop someone's share: ModerationService.mute (173) with SCREEN_SHARE -> adapter.muteTrack (130).
+[RUN]  Limit: with screen sharing allowed, a client using the LiveKit API can send camera video labelled as a screen share.
+       The SFU cannot inspect content.
+
+
+==========================================================================================
+7. HOW ACTIVE SPEAKER DETECTION WORKS
+==========================================================================================
+There are three separate layers.
+
+[CODE] Layer 1, detection on the LiveKit server. docker-compose.yml lines 175-178:
+          audio: active_level: 35, min_percentile: 40, update_interval: 400, smooth_intervals: 2
+       [LIB/INFER] The SFU uses the audio level carried with each packet and sends speaker updates to clients. This
+       is LiveKit's behaviour as described in your code comments (speaking.ts); LiveKit's source was not read.
+
+[CODE] Layer 2, display. W/pages/room/speaking.ts
+       - isSpeakingNow: participant.isSpeaking AND microphone on AND connection not lost.
+       - SpeakingHold: on immediately, off only after a release delay (SPEAKING_RELEASE_MS, default 600 ms,
+         configurable with VITE_SPEAKING_RELEASE_MS).
+       - useSpeakingIndicator (94): per-participant hook, so only that tile re-renders.
+       - FRESH_REPORT_MS 1000: after unmuting, an old "speaking" report is ignored.
+       - useClearSpeakingOnReconnect: clears stale state after a reconnection.
+       - NamedTile (RoomView.tsx) applies the green frame; screen shares are never framed.
+
+[CODE] Layer 3, speaking time statistics. W/pages/room/useSpeakerReporter.ts
+       - SpeakingTally (31) listens to RoomEvent.ActiveSpeakersChanged, adds up time, turns and longest turn.
+       - useSpeakerReporter (89) runs only for moderators and reports every 10 s.
+       - Server: POST /speaker-stats -> B/analytics/service/SpeakerStatsService.report (97). One elected moderator reports,
+         retries are de-duplicated, and only session participants count.
+       - A single turn of at least 1000 ms also publishes MeetingEvents.SpeechDetected (recording backup, section 10).
+
+[RUN]  LiveKit keeps someone "speaking" for about 600 ms after a sound stops (QA measured short bursts as turns of
+       about 800 ms).
+
+
+==========================================================================================
+8. HOW HOST MEDIA PERMISSIONS ARE ENFORCED
+==========================================================================================
+Enforcement is on the LiveKit server. Disabled buttons are only a convenience.
+
+[CODE] Data: meetings.mic_permission, camera_permission, existing screen_share_policy;
+       meeting_participants.mic_override, camera_override, screen_override (migration V10__media_permissions.sql).
+[CODE] Rule: ParticipantPolicy.mayPublish (87), in this order: audio-only limits, then moderators always allowed, then
+       the participant override, then the meeting setting.
+[CODE] Host APIs: B/moderation/controller/ModerationController.java
+          PUT /moderation/media-permissions (115)
+          PUT /moderation/participants/{id}/media-permissions (122)
+       Service: ModerationService.mediaPermissions (407), participantMediaPermissions (433). requireHost gives 403 to
+       everyone but the host, including co-hosts.
+[CODE] Live push: B/participant/service/MediaGrantSync.java. After commit it re-reads current rights and calls
+       media.updateParticipant (adapter 151), one meeting at a time, then sends signals. Methods: everyone (80),
+       participants (88), announceToHost (93), connection (102). Also covers meeting-form changes (onMediaSettingsChanged,
+       118).
+[CODE] Every token and reconnect uses the same rule (section 2).
+[CODE] Client display: W/pages/room/mediaRights.ts (mediaRights 16, useCurrentRights 31, useMediaRightNotices), ControlBar.tsx.
+       Blocked controls use aria-disabled.
+[RUN]  Live test 41/41 on the real SFU, including: revoking removes a live track; a modified client with the browser
+       check removed could not publish. QA's race scripts, rerun by the developer after the fixes, found 0 leaks.
+[RUN]  Known limits: a guest in a new browser cannot be recognised and starts from the meeting setting.
+[UNVERIFIED] The independent QA re-check of the F1-F7 media-permission fixes was stopped before it finished.
+
+
+==========================================================================================
+9. HOW INDIVIDUAL SPEAKING CLIPS ARE CAPTURED AND SAVED
+==========================================================================================
+Clips are recorded in each participant's own browser, not by LiveKit Egress.
+
+CAPTURE
+[CODE] W/pages/room/useSpeechRecorder.ts: useSpeechRecorder (186), called from RoomView.tsx 615 with
+       enabled = meeting.autoRecord.
+[CODE] Start: when useSpeakingIndicator reports speaking, using a 1500 ms release (CLIP_RELEASE_MS).
+[CODE] Stream: own microphone track, plus camera track if on. Format chosen by clipFormat: audio/webm (opus) or
+       video/webm (vp8, opus). MediaRecorder hands over a chunk each second (CHUNK_MS).
+[CODE] Voice check: W/pages/room/voiceGate.ts, measureVoice (53). AnalyserNode RMS every 50 ms. Voice = RMS >= 0.015 for
+       300 ms in total. Only then does ClipSession (useSpeechRecorder.ts 48) ask the server for a clip. No voice means
+       the clip is dropped in the browser. If the audio engine is not running, every clip counts as voice.
+
+UPLOAD
+[CODE] POST /speech-recordings      SpeechRecordingService.start (143). Requires autoRecord on and a live session. Closes
+                                    any abandoned open clip. Dates the clip from recordingStartedMsAgo, at most 10 s back.
+                                    Publishes MeetingEvents.SpeechDetected.
+[CODE] PUT  .../chunks/{seq}        appendChunk (196). Strict order; a repeated chunk is ignored. Limits: 8 MB per chunk,
+                                    500 MB per clip.
+[CODE] POST .../finish              finish (225). COMPLETED only if all chunks arrived and the file is verified; otherwise
+                                    INCOMPLETE or FAILED.
+[CODE] Client: 3 upload attempts per chunk (ClipSession.withRetry).
+
+STORAGE
+[CODE] B/recording/service/SpeechClipStorage.java: file layout DD-MM-YYYY/<Meeting>/<Participant>/<file>.webm;
+       append (152), finish (204), salvage (231). Refuses new clips when free space is low (requireFreeSpace, 132).
+[CODE] B/recording/service/SpeechClipObjectStore.java: for RECORDING_STORAGE_TYPE=S3, upload (139) and presignGet (149). The
+       local folder is then staging only. IAM role or static keys.
+[CODE] B/recording/service/SpeechRecordingRecovery.java: every minute closes clips with no chunk for 2 minutes.
+[RUN]  Live test 9/9: no clips for silence, noise or short bursts; clips kept for speech. Clip dating and lengths within
+       about 16-53 ms of the real media (QA).
+[RUN]  In this environment clips use LOCAL storage. Upload to real AWS S3 with an IAM role is [UNVERIFIED].
+
+
+==========================================================================================
+10. HOW WHOLE-MEETING CLOUD RECORDING AND LIVEKIT EGRESS WORK
+==========================================================================================
+INTENDED FLOW
+[CODE] Manual: POST /meetings/{id}/recordings -> RecordingService.start (126). Requires RECORD permission and no running
+       recording. Saves the row, tells the room first (broadcastNow, for consent), then calls media.startRoomRecording.
+[CODE] Automatic: AutoRecordingService.onSpeechDetected (97) -> startFor (142) -> startRoom (167) -> capture (189).
+       Triggered by the first speaking clip, or a reported turn of at least 1000 ms. No recording when nobody speaks.
+       After a failure it waits 5 minutes before trying again (RETRY_AFTER_FAILURE).
+[CODE] LiveKit call: LiveKitMediaAdapter.startRoomRecording (187) -> startRoomCompositeEgress. MP4, or OGG for audio-only.
+       No upload block in the request; storage comes from the egress configuration.
+[CODE] Egress configuration: docker-compose.yml, egress service (from line 187): ws_url ws://livekit:7880, Redis,
+       S3 endpoint http://minio:9000, force_path_style, cap_add SYS_ADMIN, shm_size 1gb, limits 4 CPU / 4 GB.
+[LIB]  Inside egress, headless Chrome opens a built-in web template that joins the room as a hidden participant
+       (identity EG_...), and egress records that page.
+[CODE] State updates: egress webhooks -> RecordingService.onMediaEvent (295) -> applyEgressState (320). Failed recordings
+       store the error text and notify the room.
+[CODE] Backup: RecordingReconciler.reconcile (60) checks in-flight recordings every 5 minutes.
+[CODE] Stop: RecordingService.stop (169), or automatically when the session ends (onSessionEnded, 360).
+[CODE] Access: playback-url and download-url give presigned links; retention job enforceRetention (371), default 90 days.
+
+ACTUAL STATE
+[RUN]  Never succeeded here. See section 11. The MP4/OGG, upload, playback and retention steps have therefore NEVER run
+       end to end on real media. They are [UNVERIFIED], apart from automated tests with a mocked media service.
+
+
+==========================================================================================
+11. WHY THE CLOUD RECORDINGS FAILED WITH "Start signal not received"
+==========================================================================================
+SHORT ANSWER
+LiveKit tells every client to send media to the address in LIVEKIT_NODE_IP. On this PC that is 127.0.0.1. The egress
+recorder runs inside its own Docker container, where 127.0.0.1 means that container, not LiveKit. Its media connection
+fails, so it never receives any track and never signals that recording can start.
+
+Your normal users are not affected, because their browsers run on the PC itself, where 127.0.0.1 reaches LiveKit's
+published ports.
+
+EVIDENCE, IN ORDER (one failed recording, EG_o96azSrb6Uxt, 2026-11-04) [RUN]
+  16:19:38.07  LiveKit API: StartRoomCompositeEgress, status 200. So the backend request is correct.
+  16:19:39.08  LiveKit: "starting RTC session", participant EG_o96azSrb6Uxt, kind EGRESS.
+               So the recorder's Chrome started and signalling to ws://livekit:7880 WORKS.
+  (ICE)        LiveKit's local candidates: udp4 host 127.0.0.1:51097 and tcp4 host 127.0.0.1:7881.
+               ICE check result: "state": "failed", "requestsSent": 8, "responsesReceived": 0.
+  16:19:54.10  LiveKit: "participant closing", reason SIGNAL_SOURCE_CLOSE, then "removing participant without
+               connection", connectionType "unknown".
+  16:19:54.11  Egress: chrome: END_RECORDING
+  16:19:54.16  Egress: egress_aborted, error "Start signal not received", code 412, "End reason: Source closed".
+
+Across the logs still available [RUN]:
+  - 61 egress requests, 61 "Start signal not received", 61 END_RECORDING.
+  - 0 START_RECORDING.
+  - 61 of 61 recorder participants ended "without connection".
+  - Most ended 15-20 s after the request (51 of 61). This matches the 15 s media connection timeout: 15.02 s from the session
+    start to closing in the example above.
+
+The recorder's own template explains the error message [LIB, read from the egress v1.15.0 image]:
+  - It logs START_RECORDING only after it has at least one subscribed track, which needs a working media connection.
+  - It logs END_RECORDING on RoomEvent.Disconnected.
+  So with no media connection, it can only end. It disconnects, END_RECORDING is logged with no START_RECORDING before
+  it, and egress reports "Start signal not received".
+
+Configuration behind it [CODE/RUN]:
+  - .env: LIVEKIT_NODE_IP=127.0.0.1, LIVEKIT_USE_EXTERNAL_IP not set to true.
+  - docker-compose.yml lines 155-156: use_external_ip and node_ip come from those values. The comment there already says
+    127.0.0.1 only works on this PC.
+  - docker-compose.yml line 205: egress ws_url ws://livekit:7880 (container network, so signalling works).
+  - Signalling and media use different addresses. This is why the failure is confusing: the connection starts and then dies.
+
+RULED OUT [RUN]
+  - Backend request format: LiveKit returned 200.
+  - Chrome failing to launch: the recorder's browser started and connected to LiveKit.
+  - Egress out of CPU or memory: limits detected, 4 CPU; peak use about 1.5 CPU and 1.4 GB in the example. One "high cpu"
+    warning in all logs.
+  - Storage (MinIO): the failure happens before any file is written.
+  - The silent-recording change: the failures began before that change.
+
+WHAT IS NOT PROVEN
+  [INFER]      The root cause. The mechanism is directly shown by logs, but the decisive test, a recording that succeeds
+               once the address is reachable, has NOT been run.
+  [UNVERIFIED] The other 20 of the 81. Their egress logs are gone (the container was recreated). All 81 rows have the same
+               failure reason in the database, so the same cause is likely.
+  [INFER]      10 of the 61 ended in under 15 s. These probably ended because the meeting closed first. Not checked one by
+               one.
+  [UNVERIFIED] Whether a later step would also fail once this one is fixed (for example upload to MinIO, or running with the
+               SYS_ADMIN capability). Nothing after this step has ever run.
+
+WHAT THIS MEANS FOR AWS
+  [INFER] On EC2, LIVEKIT_NODE_IP will be the public Elastic IP, not 127.0.0.1, so this exact failure should not occur, as
+          long as the egress container can reach that IP and the UDP ports. This is [UNVERIFIED].
+  NOTE: AWS_LINUX_DEPLOYMENT_REQUIREMENTS_REPORT.txt, section 9, says the cause was not investigated. That line is now out
+  of date. It was not edited, because this task allows no file changes other than this report.
+
+
+==========================================================================================
+12. HOW AUDIO PROCESSING AND NOISE SUPPRESSION ARE CONFIGURED
+==========================================================================================
+Audio passes through these stages, in this order:
+
+  Stage 1, browser capture [CODE/LIB]
+    echoCancellation: true, noiseSuppression: true (MeetingRoomPage.tsx 343; PreJoin.tsx 188 for the preview).
+    autoGainControl: true comes from the livekit-client default, not your code (line 15395).
+
+  Stage 2, Meetly noise filter [CODE] W/lib/audio/noiseFilter.ts, class NoiseFilterProcessor (97)
+    A LiveKit track processor running in the browser at 48 kHz:
+      80 Hz high-pass (BiquadFilterNode, LOW_CUT_HZ) -> RNNoise (AudioWorklet + WebAssembly, SIMD build when supported)
+      -> limiter (DynamicsCompressorNode, threshold -2, ratio 20) -> output track.
+    The chain is mono from the first node. This fixed a 6 dB loss.
+    Timeouts: RESUME_TIMEOUT_MS 1500, START_TIMEOUT_MS 8000.
+
+  Stage 3, control [CODE]
+    W/pages/room/useNoiseFilter.ts: syncNoiseFilter (42) applies the processor to the microphone track, now and on each
+    later publish. Called for the stage room and the own audience room (RoomView.tsx 608-609).
+    W/lib/audio/noiseReductionPref.ts: on by default, saved in localStorage key mp-noise-reduction. Toggle in the
+    microphone menu (NoiseReductionItem in ControlBar.tsx).
+
+  Fallbacks [CODE]
+    isNoiseFilterSupported() false: filter not used. AudioBlockedError: retried on the next click or key press. Other
+    failure: plain microphone with browser processing. The microphone is never blocked by the filter.
+
+  What receives cleaned audio [CODE, from the comment in noiseFilter.ts; INFER for cloud recording]
+    The meeting and the SFU's speaking detection (they receive the published track). Speaking clips: useSpeechRecorder takes
+    mic.track.mediaStreamTrack, which is the processed track. Cloud recording has never run, so that part is unconfirmed.
+
+  CSP [CODE] web/nginx.conf line 98: script-src includes 'wasm-unsafe-eval' for WebAssembly; worker-src allows blob:.
+
+[RUN] Noise-only test: QA found 0 clips with noise reduction on and off, because LiveKit never reported the noise as
+      speaking in that test.
+[UNVERIFIED] Audio quality on real microphones and in real rooms, and in Safari or Firefox. Tests used Chromium with fake
+             audio devices.
+
+
+==========================================================================================
+13. SUMMARY OF WHAT IS AND IS NOT VERIFIED
+==========================================================================================
+VERIFIED WORKING (live tests in this project)
+  Join, leave, publish, subscribe, screen share, host permissions, active speaker display, speaking clips with LOCAL storage.
+  All tests used Chromium with fake devices, on one PC.
+
+VERIFIED NOT WORKING
+  Cloud recording (Egress). Mechanism shown in section 11.
+
+NOT VERIFIED
+  - Any cloud recording step after the media connection: encoding, upload, playback, retention.
+  - The proposed root cause by a successful recording.
+  - Speaking clips on real AWS S3 with an IAM role.
+  - Real devices, Safari, Firefox, mobile browsers, and real networks (TURN path not exercised).
+  - Capacity: no load test has been run.
+  - LiveKit token refresh during long meetings.
+  - LiveKit server internals (token validation, speaker detection): behaviour observed, source not read.
+  - Completion of the QA re-check for the media-permission fixes F1-F7.
+
+Report only. Nothing was fixed. Awaiting your review.

@@ -161,8 +161,38 @@ public class FileService {
         participantAccess.requireMeetingViewer(meetingId, participantId, token, user);
         FileMetadata meta = files.findByIdAndMeetingIdAndDeletedAtIsNull(fileId, meetingId)
                 .orElseThrow(() -> ApiException.notFound("File"));
+        // In the database, but its object may be gone: say so now instead of handing out a dead link.
+        if (!storage.exists(properties.storage().filesBucket(), meta.getStorageKey())) {
+            throw new ApiException(ErrorCode.NOT_FOUND, "This file is no longer available.");
+        }
         return storage.presignGet(properties.storage().filesBucket(), meta.getStorageKey(),
                 properties.storage().presignTtl(), meta.getFileName());
+    }
+
+    /**
+     * Whoever shared the file, even after leaving or after the meeting ended, or a host or co-host who is in the
+     * meeting now. Nobody who was denied or removed can delete, not even their own file. The row is marked in the same
+     * transaction as the
+     * object is removed: if storage fails, the row stays and the file is still listed. Shared files are only ever
+     * removed this way, never automatically.
+     */
+    @Transactional
+    public void delete(UUID meetingId, UUID fileId, UUID participantId, String token, Optional<CurrentUser> user) {
+        MeetingParticipant caller = participantAccess.resolve(meetingId, participantId, token, user);
+        if (!participantAccess.inGoodStanding(caller)) {
+            throw ApiException.forbidden("You no longer have access to this meeting's files.");
+        }
+        FileMetadata meta = files.findByIdAndMeetingIdAndDeletedAtIsNull(fileId, meetingId)
+                .orElseThrow(() -> ApiException.notFound("File"));
+        boolean uploader = caller.getId().equals(meta.getUploadedByParticipantId());
+        boolean activeModerator = caller.isPresent() && caller.getRole().isModerator();
+        if (!uploader && !activeModerator) {
+            throw ApiException.forbidden("Only the person who shared this file, or the host, can delete it.");
+        }
+        storage.delete(properties.storage().filesBucket(), meta.getStorageKey());
+        meta.markDeleted(clock.instant());
+        roomSessions.active(meetingId).ifPresent(room -> signals.broadcast(room.getLivekitRoomName(),
+                RoomSignals.TOPIC_FILES, Map.of("type", "file-deleted", "fileId", fileId.toString())));
     }
 
     private String validateType(String declared, String fileName) {
@@ -228,10 +258,12 @@ public class FileService {
     }
 
     public record FileView(UUID id, String fileName, String contentType, long sizeBytes, String uploadedBy,
+                           UUID uploadedByParticipantId,
                            Instant createdAt) {
 
         static FileView of(FileMetadata m) {
             return new FileView(m.getId(), m.getFileName(), m.getContentType(), m.getSizeBytes(), m.getUploadedByName(),
+                    m.getUploadedByParticipantId(),
                     m.getCreatedAt());
         }
     }

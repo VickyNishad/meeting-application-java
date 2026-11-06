@@ -23,11 +23,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
-import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Development storage ({@code app.storage.type=local}, set by the "dev" profile): each bucket is a folder under
- * {@code app.storage.local-root} (e.g. {@code D:/meetly/meet-recordings}). Objects stay private: "presigned" URLs
+ * Development storage ({@code STORAGE_PROVIDER=local}): shared files and recordings are folders under
+ * {@code STORAGE_LOCAL_BASE_PATH} ({@code shared-files/}, {@code meeting-recordings/}). Objects stay private: "presigned" URLs
  * point at {@link LocalStorageController} and carry an HMAC over bucket, key, expiry and download name.
  */
 @Component
@@ -35,11 +36,14 @@ import java.util.Set;
 public class LocalFileObjectStorage implements ObjectStorage {
 
     static final String DOWNLOAD_PATH = "/api/v1/storage/local";
+    static final String FILES_FOLDER = "shared-files";
+    static final String RECORDINGS_FOLDER = "meeting-recordings";
 
     private static final Logger log = LoggerFactory.getLogger(LocalFileObjectStorage.class);
 
     private final Path root;
-    private final Set<String> buckets;
+    /** The folder of each configured bucket name. */
+    private final Map<String, String> folders;
     private final String publicUrl;
     private final byte[] signingKey;
     private final Clock clock;
@@ -50,17 +54,20 @@ public class LocalFileObjectStorage implements ObjectStorage {
             throw new IllegalStateException("app.storage.local-root must be set when app.storage.type=local");
         }
         this.root = Path.of(props.localRoot()).toAbsolutePath().normalize();
-        this.buckets = Set.of(props.recordingsBucket(), props.filesBucket());
+        // A HashMap, not Map.of: both bucket names may be the same (one bucket with prefixes), the keys stay apart.
+        this.folders = new HashMap<>();
+        folders.put(props.recordingsBucket(), RECORDINGS_FOLDER);
+        folders.put(props.filesBucket(), FILES_FOLDER);
         this.publicUrl = properties.publicUrl().replaceAll("/+$", "");
         // Separate key per purpose: an access token signature can never double as a download signature.
         this.signingKey = hmac(properties.security().jwtSecret().getBytes(StandardCharsets.UTF_8),
                 "local-object-storage");
         this.clock = clock;
-        for (String bucket : buckets) {
+        for (String folder : folders.values()) {
             try {
-                Files.createDirectories(root.resolve(bucket));
+                Files.createDirectories(root.resolve(folder));
             } catch (IOException e) {
-                throw new IllegalStateException("Cannot create local storage folder " + root.resolve(bucket), e);
+                throw new IllegalStateException("Cannot create local storage folder " + root.resolve(folder), e);
             }
         }
         log.info("Local object storage at {}", root);
@@ -88,6 +95,11 @@ public class LocalFileObjectStorage implements ObjectStorage {
         } catch (IOException e) {
             throw new ApiException(ErrorCode.STORAGE_UNAVAILABLE, "File storage is unavailable.", e);
         }
+    }
+
+    @Override
+    public boolean exists(String bucket, String key) {
+        return Files.isRegularFile(resolve(bucket, key));
     }
 
     @Override
@@ -122,10 +134,10 @@ public class LocalFileObjectStorage implements ObjectStorage {
 
     /** bucket/key inside the storage root; anything that would escape its bucket folder is refused. */
     private Path resolve(String bucket, String key) {
-        if (bucket == null || !buckets.contains(bucket) || key == null || key.isBlank()) {
+        if (bucket == null || !folders.containsKey(bucket) || key == null || key.isBlank()) {
             throw ApiException.notFound("File");
         }
-        Path bucketDir = root.resolve(bucket);
+        Path bucketDir = root.resolve(folders.get(bucket));
         Path path = bucketDir.resolve(key).normalize();
         if (!path.startsWith(bucketDir) || path.equals(bucketDir)) {
             throw ApiException.notFound("File");

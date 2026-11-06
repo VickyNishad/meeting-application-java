@@ -110,7 +110,7 @@ public class SecurityConfig {
                         // A clip file through its signed, short-lived URL: the signature is the authorization.
                         .requestMatchers(HttpMethod.GET, "/api/v1/speech-recordings/*/content").permitAll()
                         .requestMatchers("/api/v1/meetings/*/chat", "/api/v1/meetings/*/files",
-                                "/api/v1/meetings/*/files/*/download-url").permitAll()
+                                "/api/v1/meetings/*/files/*", "/api/v1/meetings/*/files/*/download-url").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/booking-pages/public/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/bookings").permitAll()
                         .requestMatchers("/api/v1/bookings/manage/**").permitAll()

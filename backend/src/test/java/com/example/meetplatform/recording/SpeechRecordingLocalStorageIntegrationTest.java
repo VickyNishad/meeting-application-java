@@ -2,6 +2,7 @@ package com.example.meetplatform.recording;
 
 import com.example.meetplatform.recording.SpeechClipFlow.Who;
 import com.example.meetplatform.recording.service.SpeechClipObjectStore;
+import com.example.meetplatform.recording.service.SpeechRecordingService;
 import com.example.meetplatform.support.AbstractIntegrationTest;
 import com.example.meetplatform.support.TestUsers;
 import org.junit.jupiter.api.BeforeEach;
@@ -50,6 +51,9 @@ class SpeechRecordingLocalStorageIntegrationTest extends AbstractIntegrationTest
     @Autowired
     SpeechClipObjectStore objectStore;
 
+    @Autowired
+    SpeechRecordingService service;
+
     private SpeechClipFlow flow;
 
     @BeforeEach
@@ -86,6 +90,24 @@ class SpeechRecordingLocalStorageIntegrationTest extends AbstractIntegrationTest
         assertThat(play.getHeader("Content-Disposition")).startsWith("inline");
     }
 
+
+    /** The 90-day rule is for S3 only: clips on local disk are never removed automatically. */
+    @Test
+    void localClipsAreNeverRemovedByRetention() throws Exception {
+        String m = flow.meeting("Kept locally");
+        flow.joinAsHost(m);
+        Who guest = flow.joinAsGuest(m, "Local Guest");
+        String id = flow.recordClip(guest, 2).get("id").asString();
+        jdbc.update("update speech_recordings set start_time = now() - interval '400 days' where id = ?", UUID.fromString(id));
+
+        assertThat(service.deleteExpired().deleted()).isZero();
+
+        String path = jdbc.queryForObject("select storage_path from speech_recordings where id = ?", String.class,
+                UUID.fromString(id));
+        assertThat(ROOT.resolve(path)).exists();
+        assertThat(jdbc.queryForObject("select deleted_at is null from speech_recordings where id = ?", Boolean.class,
+                UUID.fromString(id))).isTrue();
+    }
     @Test
     void theDevProfileDefaultsToTheWindowsDDriveFolderAndHonoursTheEnvironment() throws Exception {
         StandardEnvironment env = new StandardEnvironment();

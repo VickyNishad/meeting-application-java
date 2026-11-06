@@ -16,7 +16,7 @@ Video meetings (LiveKit SFU), host controls, cloud & local recording, and Calend
 cp .env.example .env          # set secrets
 docker compose up -d --build
 ```
-Web app http://localhost:3000 · Mailpit http://localhost:8025 · API docs http://localhost:3000/swagger-ui.html
+Web app http://localhost:3000 · API docs http://localhost:3000/swagger-ui.html
 
 ## Build and test without Docker
 ```bash

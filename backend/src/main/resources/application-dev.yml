@@ -1,21 +1,18 @@
 # Local development on a developer PC. Activate with SPRING_PROFILES_ACTIVE=dev (start-local.ps1 does this).
 # Cloud recordings and shared files are kept on this PC's disk instead of S3/MinIO, under ./data (relative to the
-# API's working directory): data/meet-recordings/...  data/meet-files/... Speaking clips go to
+# API's working directory): data/meeting-recordings/...  data/shared-files/... Speaking clips go to
 # D:/MeetingApplication/Recordings (RECORDING_LOCAL_PATH). Override with the env vars below.
 # Note: cloud recordings are written by the LiveKit egress worker; in dev it must write into the same folder.
 app:
   # Speaking clips on this PC's D: drive (Recordings/DD-MM-YYYY/Meeting/Participant/...).
   speech-recordings:
-    storage-type: ${RECORDING_STORAGE_TYPE:LOCAL}
+    storage-type: ${RECORDING_STORAGE_TYPE:${STORAGE_PROVIDER:LOCAL}}
     storage-path: ${RECORDING_LOCAL_PATH:${RECORDING_STORAGE_PATH:D:/MeetingApplication/Recordings}}
   security:
     cookie-secure: ${APP_COOKIE_SECURE:false}
   storage:
-    type: local
-    local-root: ${APP_STORAGE_LOCAL_ROOT:./data}
-    # Not used by local storage; placeholders so S3 credentials are not required to start in dev.
-    access-key: ${S3_ACCESS_KEY:unused-in-dev}
-    secret-key: ${S3_SECRET_KEY:unused-in-dev}
+    type: ${STORAGE_PROVIDER:local}
+    local-root: ${STORAGE_LOCAL_BASE_PATH:${APP_STORAGE_LOCAL_ROOT:./data}}
   # Single API instance without Redis: room signal numbers and job locks are kept in memory.
   coordination:
     store: ${APP_COORDINATION_STORE:memory}

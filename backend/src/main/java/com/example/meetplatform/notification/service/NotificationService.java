@@ -31,6 +31,15 @@ public class NotificationService {
     }
 
     @Transactional
+    public void emailWithLink(UUID userId, String to, String type, String subject, String body, String link,
+                              boolean sensitive, UUID referenceId) {
+        Notification n = Notification.email(userId, to, type, subject, body, null, sensitive, referenceId,
+                clock.instant(), clock.instant());
+        n.setLink(link);
+        notifications.save(n);
+    }
+
+    @Transactional
     public void emailAt(UUID userId, String to, String type, String subject, String body, String ics,
                         boolean sensitive, UUID referenceId, Instant sendAt) {
         notifications.save(Notification.email(userId, to, type, subject, body, ics, sensitive, referenceId, sendAt,

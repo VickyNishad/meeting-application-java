@@ -1,12 +1,16 @@
-# Full local stack: PostgreSQL, Redis, S3-compatible storage (MinIO), Mailpit, LiveKit SFU + Egress, API and web.
+# Full stack: PostgreSQL, Redis, LiveKit SFU, API and web. Files are kept on local disk unless STORAGE_PROVIDER=s3.
+# Mail goes through the SMTP server set in .env, in every environment.
 #   cp .env.example .env                                  # then edit secrets
 #   docker compose up -d --build
 #   docker compose --profile observability up -d          # adds Prometheus, Grafana, Jaeger
 #   docker compose --profile tls up -d                    # adds Caddy: HTTPS for web, API, LiveKit and S3 (needs a domain)
+#   docker compose --profile minio up -d                  # adds MinIO, an S3-compatible server (STORAGE_PROVIDER=s3, S3_ENDPOINT=http://minio:9000)
+#   docker compose --profile egress up -d                 # adds the recorder (needs 4 vCPU / 4 GB and APP_CLOUD_RECORDING_ENABLED=true)
 # Step-by-step Windows guide and helper scripts: README-Docker.md, scripts/docker-*.bat
-# Web app: http://localhost:3000   Mail: http://localhost:8025
+# Web app: http://localhost:3000
 #
-# DATA_ROOT (default ./docker, next to this file) holds MinIO, Redis, recordings and nightly database backups.
+# DATA_ROOT (default ./docker, next to this file) holds MinIO, Redis, speaking clips and nightly database backups.
+# STORAGE_LOCAL_BASE_PATH (default ./storage) holds shared files and recordings when STORAGE_PROVIDER=local.
 # These folders are git-ignored. PostgreSQL, Prometheus and Grafana use named volumes.
 name: meet-platform
 
@@ -111,11 +115,13 @@ services:
 
   minio:
     <<: *restart
+    # Optional: not needed with STORAGE_PROVIDER=local or with AWS S3.
+    profiles: ["minio"]
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set in .env}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set in .env}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-}
     volumes:
       - type: bind
         source: ${DATA_ROOT:-./docker}/minio
@@ -126,13 +132,6 @@ services:
       # they go through Caddy instead. Set S3_BIND_ADDRESS=0.0.0.0 only to serve S3_PUBLIC_ENDPOINT directly.
       - "${S3_BIND_ADDRESS:-127.0.0.1}:9000:9000"
       - "127.0.0.1:9001:9001"
-
-  mailpit:
-    <<: *restart
-    image: axllent/mailpit:v1.32.0
-    ports:
-      - "127.0.0.1:8025:8025"
-      - "127.0.0.1:1025:1025"
 
   livekit:
     <<: *restart
@@ -186,12 +185,16 @@ services:
 
   egress:
     <<: *restart
+    # Optional: whole-meeting recording. Needs APP_CLOUD_RECORDING_ENABLED=true. Too heavy for a small server: run it
+    # on its own machine there.
+    profiles: ["egress"]
     image: livekit/egress:v1.15.0
     depends_on:
       livekit:
         condition: service_started
       minio:
         condition: service_started
+        required: false
     cap_add:
       - SYS_ADMIN
     shm_size: 1gb
@@ -209,12 +212,13 @@ services:
         health_port: 9090
         log_level: info
         s3:
-          access_key: ${S3_ACCESS_KEY}
-          secret: ${S3_SECRET_KEY}
-          region: us-east-1
-          endpoint: http://minio:9000
-          bucket: ${S3_RECORDINGS_BUCKET:-meet-recordings}
-          force_path_style: true
+          # Empty keys on AWS: the IAM role of the machine.
+          access_key: ${S3_ACCESS_KEY:-}
+          secret: ${S3_SECRET_KEY:-}
+          region: ${S3_REGION:-${AWS_REGION:-us-east-1}}
+          endpoint: ${S3_ENDPOINT-http://minio:9000}
+          bucket: ${S3_RECORDINGS_BUCKET:-${AWS_S3_BUCKET:-meet-recordings}}
+          force_path_style: ${S3_FORCE_PATH_STYLE:-true}
 
   backend:
     <<: *restart
@@ -226,6 +230,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+        required: false
     deploy:
       resources:
         limits: { cpus: "2", memory: 2g }
@@ -233,13 +238,19 @@ services:
       # prod forces Secure cookies, e-mail verification, S3 storage and disables Swagger (application-prod.yml).
       # For local Swagger set SPRING_PROFILES_ACTIVE= (empty) in .env.
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE-prod}
+      # Where files are kept: local (default) or s3. See .env.example.
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      STORAGE_LOCAL_BASE_PATH: /data/storage
+      STORAGE_PRESIGN_TTL: ${STORAGE_PRESIGN_TTL:-PT15M}
+      APP_CLOUD_RECORDING_ENABLED: ${APP_CLOUD_RECORDING_ENABLED:-false}
+      APP_SPEECH_CLIP_RETENTION_DAYS: ${APP_SPEECH_CLIP_RETENTION_DAYS:-90}
       # Speaking clips. LOCAL: kept in /data/recordings (the host folder RECORDING_LOCAL_PATH, mounted below).
       # S3: that folder is staging only; finished clips go to AWS_S3_BUCKET (IAM role, or the AWS_* keys).
       RECORDING_STORAGE_PATH: /data/recordings
-      RECORDING_STORAGE_TYPE: ${RECORDING_STORAGE_TYPE:-}
+      RECORDING_STORAGE_TYPE: ${RECORDING_STORAGE_TYPE:-${STORAGE_PROVIDER:-}}
       AWS_REGION: ${AWS_REGION:-}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
-      AWS_S3_PREFIX: ${AWS_S3_PREFIX:-}
+      AWS_S3_PREFIX: ${AWS_S3_PREFIX:-speaking-clips}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-meet}
@@ -254,24 +265,27 @@ services:
       APP_REQUIRE_EMAIL_VERIFICATION: ${APP_REQUIRE_EMAIL_VERIFICATION:-true}
       APP_OPENAPI_ENABLED: ${APP_OPENAPI_ENABLED:-false}
       APP_RECORDING_RETENTION_DAYS: ${APP_RECORDING_RETENTION_DAYS:-90}
-      APP_MAIL_FROM: ${APP_MAIL_FROM}
+      APP_MAIL_FROM: ${APP_MAIL_FROM:?set APP_MAIL_FROM in .env}
       LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL}
       LIVEKIT_API_URL: http://livekit:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
-      S3_ENDPOINT: http://minio:9000
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
-      S3_SECRET_KEY: ${S3_SECRET_KEY}
-      S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-meet-recordings}
+      # Unset: MinIO. Set empty (S3_ENDPOINT=) for AWS S3.
+      S3_ENDPOINT: ${S3_ENDPOINT-http://minio:9000}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      S3_REGION: ${S3_REGION:-${AWS_REGION:-us-east-1}}
+      S3_RECORDINGS_BUCKET: ${S3_RECORDINGS_BUCKET:-${AWS_S3_BUCKET:-meet-recordings}}
+      S3_FILES_BUCKET: ${S3_FILES_BUCKET:-${AWS_S3_BUCKET:-meet-files}}
       APP_COORDINATION_STORE: redis
       APP_METRICS_SCRAPE_PASSWORD: ${APP_METRICS_SCRAPE_PASSWORD:-}
-      SMTP_HOST: ${SMTP_HOST:-mailpit}
-      SMTP_PORT: ${SMTP_PORT:-1025}
-      SMTP_USERNAME: ${SMTP_USERNAME:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_AUTH: ${SMTP_AUTH:-false}
-      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      SMTP_HOST: ${SMTP_HOST:?set SMTP_HOST in .env}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:?set SMTP_USERNAME in .env}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:?set SMTP_PASSWORD in .env}
+      SMTP_AUTH: ${SMTP_AUTH:-true}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
       APP_CALENDAR_ENCRYPTION_KEY: ${APP_CALENDAR_ENCRYPTION_KEY:-}
       APP_CALENDAR_CALLBACK_BASE_URL: ${APP_CALENDAR_CALLBACK_BASE_URL:-}
       GOOGLE_CALENDAR_CLIENT_ID: ${GOOGLE_CALENDAR_CLIENT_ID:-}
@@ -287,6 +301,10 @@ services:
       - type: bind
         source: ${RECORDING_LOCAL_PATH:-${DATA_ROOT:-./docker}/Recordings}
         target: /data/recordings
+        bind: { create_host_path: true }
+      - type: bind
+        source: ${STORAGE_LOCAL_BASE_PATH:-./storage}
+        target: /data/storage
         bind: { create_host_path: true }
     ports:
       # Loopback only: browsers reach the API through the web container's nginx (or Caddy), never directly.
@@ -317,9 +335,13 @@ services:
     profiles: ["tls"]
     image: caddy:2.10-alpine
     depends_on:
-      - web
-      - livekit
-      - minio
+      web:
+        condition: service_started
+      livekit:
+        condition: service_started
+      minio:
+        condition: service_started
+        required: false
     environment:
       SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
       S3_DOMAIN: ${S3_DOMAIN:-s3.localhost}

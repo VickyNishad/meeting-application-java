@@ -37,13 +37,13 @@ spring:
       timeout: 2s
       connect-timeout: 2s
   mail:
-    host: ${SMTP_HOST:localhost}
-    port: ${SMTP_PORT:1025}
+    host: ${SMTP_HOST:smtp.gmail.com}
+    port: ${SMTP_PORT:587}
     username: ${SMTP_USERNAME:}
     password: ${SMTP_PASSWORD:}
     properties:
-      mail.smtp.auth: ${SMTP_AUTH:false}
-      mail.smtp.starttls.enable: ${SMTP_STARTTLS:false}
+      mail.smtp.auth: ${SMTP_AUTH:true}
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS:true}
       mail.smtp.connectiontimeout: 5000
       mail.smtp.timeout: 10000
       mail.smtp.writetimeout: 10000
@@ -143,29 +143,37 @@ app:
     empty-room-timeout-seconds: 300
     request-timeout: 10s
   storage:
+    # Empty = AWS S3 in the region below. Set only for an S3-compatible server (tests, MinIO).
     endpoint: ${S3_ENDPOINT:http://localhost:9000}
-    public-endpoint: ${S3_PUBLIC_ENDPOINT:http://localhost:9000}
-    access-key: ${S3_ACCESS_KEY}
-    secret-key: ${S3_SECRET_KEY}
-    region: ${S3_REGION:us-east-1}
-    recordings-bucket: ${S3_RECORDINGS_BUCKET:meet-recordings}
-    files-bucket: ${S3_FILES_BUCKET:meet-files}
-    presign-ttl: 15m
-    type: ${APP_STORAGE_TYPE:s3}
-    local-root: ${APP_STORAGE_LOCAL_ROOT:}
+    # Empty on AWS. Only for an S3-compatible server: the address browsers reach it at.
+    public-endpoint: ${S3_PUBLIC_ENDPOINT:}
+    # Empty on AWS: the IAM role of the server. Needed for an S3-compatible server such as MinIO.
+    access-key: ${S3_ACCESS_KEY:}
+    secret-key: ${S3_SECRET_KEY:}
+    region: ${S3_REGION:${AWS_REGION:us-east-1}}
+    recordings-bucket: ${S3_RECORDINGS_BUCKET:${AWS_S3_BUCKET:meet-recordings}}
+    files-bucket: ${S3_FILES_BUCKET:${AWS_S3_BUCKET:meet-files}}
+    presign-ttl: ${STORAGE_PRESIGN_TTL:PT15M}
+    # local or s3. Anything else stops the application at startup.
+    type: ${STORAGE_PROVIDER:${APP_STORAGE_TYPE:s3}}
+    local-root: ${STORAGE_LOCAL_BASE_PATH:${APP_STORAGE_LOCAL_ROOT:}}
   recording:
     default-retention-days: ${APP_RECORDING_RETENTION_DAYS:90}
     file-prefix: recordings
+    # Whole-meeting recording (LiveKit Egress). Off by default: turn on only where a recorder is deployed.
+    cloud-enabled: ${APP_CLOUD_RECORDING_ENABLED:false}
   speech-recordings:
     # LOCAL: clips are kept in storage-path. S3: storage-path is a staging folder; finished clips go to the private
     # bucket below, same DD-MM-YYYY/<Meeting>/<Participant>/<file> layout (see SpeechClipObjectStore).
-    # Empty = S3 with the prod profile, LOCAL otherwise.
-    storage-type: ${RECORDING_STORAGE_TYPE:}
+    # Follows STORAGE_PROVIDER unless RECORDING_STORAGE_TYPE is set. Empty = S3 with the prod profile, LOCAL otherwise.
+    storage-type: ${RECORDING_STORAGE_TYPE:${STORAGE_PROVIDER:}}
     storage-path: ${RECORDING_LOCAL_PATH:${RECORDING_STORAGE_PATH:./data/Recordings}}
     s3:
       region: ${AWS_REGION:}
       bucket: ${AWS_S3_BUCKET:}
-      prefix: ${AWS_S3_PREFIX:}
+      # One bucket holds everything: clips under this prefix, files/ and recordings/ next to it. The 90-day lifecycle
+      # rule targets this prefix only, so it must not be empty when the bucket is shared.
+      prefix: ${AWS_S3_PREFIX:speaking-clips}
       # Empty = AWS (https://s3.<region>.amazonaws.com). Only set for an S3-compatible server (tests, MinIO).
       endpoint: ${AWS_S3_ENDPOINT:}
       # Empty = the server's IAM role (instance profile / task role / web identity). Prefer the role in production.
@@ -174,7 +182,13 @@ app:
     min-free-bytes: ${RECORDING_MIN_FREE_BYTES:209715200}
     max-chunk-bytes: 8388608
     max-clip-bytes: 524288000
-    access-url-ttl: PT10M
+    access-url-ttl: ${STORAGE_PRESIGN_TTL:PT10M}
+    # With S3 storage: clips older than this are removed and marked deleted, in step with the S3 lifecycle rule on the
+    # clip prefix. 0 = never. Local clips are never removed automatically.
+    retention-days: ${APP_SPEECH_CLIP_RETENTION_DAYS:90}
+    retention-cron: "0 45 3 * * *"
+    # Longest one run may take, below its 30-minute job lock. During an outage every clip waits for a timeout.
+    retention-run-limit: PT20M
     stale-after: PT2M
     recovery-interval: PT1M
   rate-limit:

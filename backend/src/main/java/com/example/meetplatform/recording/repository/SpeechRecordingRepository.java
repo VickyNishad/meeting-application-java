@@ -2,6 +2,7 @@ package com.example.meetplatform.recording.repository;
 
 import com.example.meetplatform.recording.entity.SpeechRecording;
 import jakarta.persistence.LockModeType;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.data.jpa.repository.Lock;
@@ -36,6 +37,28 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
             """)
     List<UUID> openClipIds(UUID participantId);
 
+    /**
+     * Finished clips past their retention whose object has not been removed yet, oldest first, after the given
+     * position. Paging by position rather than page number lets a run move past clips that could not be removed.
+     */
+    @Query("""
+            select r from SpeechRecording r
+            where r.deletedAt is null and r.startTime < :before
+              and r.status <> com.example.meetplatform.recording.entity.SpeechRecording.Status.RECORDING
+              and (r.startTime > :afterTime or (r.startTime = :afterTime and r.id > :afterId))
+            order by r.startTime, r.id
+            """)
+    List<SpeechRecording> findExpiredAfter(Instant before, Instant afterTime, UUID afterId, Pageable page);
+
+    /** How many clips {@link #findExpiredAfter} has left from the given position. */
+    @Query("""
+            select count(r) from SpeechRecording r
+            where r.deletedAt is null and r.startTime < :before
+              and r.status <> com.example.meetplatform.recording.entity.SpeechRecording.Status.RECORDING
+              and (r.startTime > :afterTime or (r.startTime = :afterTime and r.id > :afterId))
+            """)
+    long countExpiredAfter(Instant before, Instant afterTime, UUID afterId);
+
     // Filter values, per viewer: meetings the user hosts ("hosted") or clips of the user's own participations ("mine").
 
     // The filter follows Date -> Meeting -> Participant, so meetings and participants come with the folder dates
@@ -44,7 +67,7 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
     /** Meetings with clips: id, title, folder date, and the latest clip under that title (to pick a renamed meeting's title). */
     @Query("""
             select r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10), max(r.startTime)
-            from SpeechRecording r where r.hostId = :user
+            from SpeechRecording r where r.hostId = :user and r.deletedAt is null
             group by r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10)
             """)
     List<Object[]> hostedMeetings(UUID user);
@@ -57,17 +80,17 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
     @Query("""
             select distinct r.participantId, r.participantName, r.meetingId, substring(r.storagePath, 1, 10),
                    case when r.participantUserId = r.hostId then true else false end
-            from SpeechRecording r where r.hostId = :user
+            from SpeechRecording r where r.hostId = :user and r.deletedAt is null
             """)
     List<Object[]> hostedParticipants(UUID user);
 
     /** The folder date (DD-MM-YYYY, the first segment of the storage path). */
-    @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.hostId = :user")
+    @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.hostId = :user and r.deletedAt is null")
     List<String> hostedDates(UUID user);
 
     @Query("""
             select r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10), max(r.startTime)
-            from SpeechRecording r where r.participantUserId = :user
+            from SpeechRecording r where r.participantUserId = :user and r.deletedAt is null
             group by r.meetingId, r.meetingTitle, substring(r.storagePath, 1, 10)
             """)
     List<Object[]> ownMeetings(UUID user);
@@ -75,10 +98,10 @@ public interface SpeechRecordingRepository extends JpaRepository<SpeechRecording
     @Query("""
             select distinct r.participantId, r.participantName, r.meetingId, substring(r.storagePath, 1, 10),
                    case when r.participantUserId = r.hostId then true else false end
-            from SpeechRecording r where r.participantUserId = :user
+            from SpeechRecording r where r.participantUserId = :user and r.deletedAt is null
             """)
     List<Object[]> ownParticipants(UUID user);
 
-    @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.participantUserId = :user")
+    @Query("select distinct substring(r.storagePath, 1, 10) from SpeechRecording r where r.participantUserId = :user and r.deletedAt is null")
     List<String> ownDates(UUID user);
 }

@@ -26,11 +26,13 @@ import com.example.meetplatform.recording.entity.SpeechRecording;
 import com.example.meetplatform.recording.repository.SpeechRecordingRepository;
 import com.example.meetplatform.room.entity.MeetingRoom;
 import com.example.meetplatform.room.service.RoomSessionService;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.persistence.criteria.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
@@ -85,6 +87,10 @@ import java.util.stream.Stream;
 public class SpeechRecordingService {
 
     private static final Logger log = LoggerFactory.getLogger(SpeechRecordingService.class);
+    private static final int RETENTION_BATCH = 50;
+    /** Failing clips named per run in the log; the rest are counted in the summary. */
+    private static final int RETENTION_FAILURES_LOGGED = 10;
+    private static final UUID FIRST_ID = new UUID(0, 0);
     /** How far before the request a clip may be dated (the browser waits for a voice before asking). */
     static final Duration MAX_START_BACKDATE = Duration.ofSeconds(10);
     public static final String CONTENT_PATH = "/api/v1/speech-recordings/{id}/content";
@@ -108,6 +114,9 @@ public class SpeechRecordingService {
     private final String publicUrl;
     private final byte[] signingKey;
     private final ApplicationEventPublisher events;
+    private final int retentionDays;
+    private final Duration retentionRunLimit;
+    private final MeterRegistry meters;
 
     public SpeechRecordingService(SpeechRecordingRepository recordings, MeetingRepository meetings,
                                   ParticipantAccessService participantAccess, RoomSessionService roomSessions,
@@ -117,7 +126,13 @@ public class SpeechRecordingService {
                                   @Value("${app.speech-recordings.max-chunk-bytes:8388608}") long maxChunkBytes,
                                   @Value("${app.speech-recordings.max-clip-bytes:524288000}") long maxClipBytes,
                                   @Value("${app.speech-recordings.access-url-ttl:PT10M}") Duration accessTtl,
-                                  ApplicationEventPublisher events) {
+                                  ApplicationEventPublisher events,
+                                  @Value("${app.speech-recordings.retention-days:90}") int retentionDays,
+                                  @Value("${app.speech-recordings.retention-run-limit:PT20M}") Duration retentionRunLimit,
+                                  MeterRegistry meters) {
+        this.retentionRunLimit = retentionRunLimit;
+        this.meters = meters;
+        this.retentionDays = retentionDays;
         this.events = events;
         this.recordings = recordings;
         this.meetings = meetings;
@@ -274,6 +289,77 @@ public class SpeechRecordingService {
         return n;
     }
 
+    /**
+     * What one retention run did. {@code failed} clips could not be removed and {@code skipped} clips were not reached
+     * before the run's time limit. Both stay as they are, and the next run tries them again.
+     */
+    public record RetentionRun(int deleted, int failed, long skipped) {
+    }
+
+    /**
+     * Daily, S3 only: removes the objects of clips past their retention and marks their rows. The row stays as the
+     * record of the clip; it is no longer listed or playable. The object goes first, so a crash in between only means
+     * a repeat delete, which S3 accepts. A clip that cannot be removed is passed over, so it never holds up the clips
+     * behind it. Only clips are touched here, and local clips are never removed.
+     */
+    public RetentionRun deleteExpired() {
+        if (!objectStore.enabled() || retentionDays <= 0) {
+            return new RetentionRun(0, 0, 0);
+        }
+        Instant start = clock.instant();
+        Instant before = start.minus(Duration.ofDays(retentionDays));
+        RetentionPass pass = new RetentionPass(start.plus(retentionRunLimit));
+        while (Boolean.TRUE.equals(tx.execute(s -> removeNextBatch(before, pass)))) {
+            // Each batch commits on its own, so one that succeeded is kept whatever happens later.
+        }
+        long skipped = pass.outOfTime ? recordings.countExpiredAfter(before, pass.afterTime, pass.afterId) : 0;
+        meters.counter("meet.speech_clips.retention", "result", "deleted").increment(pass.deleted);
+        meters.counter("meet.speech_clips.retention", "result", "failed").increment(pass.failed);
+        meters.counter("meet.speech_clips.retention", "result", "skipped").increment(skipped);
+        return new RetentionRun(pass.deleted, pass.failed, skipped);
+    }
+
+    /** @return whether there may be more clips to look at */
+    private boolean removeNextBatch(Instant before, RetentionPass pass) {
+        List<SpeechRecording> batch = recordings.findExpiredAfter(before, pass.afterTime, pass.afterId,
+                PageRequest.of(0, RETENTION_BATCH));
+        for (SpeechRecording clip : batch) {
+            if (clock.instant().isAfter(pass.deadline)) {
+                pass.outOfTime = true;
+                return false;
+            }
+            pass.afterTime = clip.getStartTime();
+            pass.afterId = clip.getId();
+            try {
+                objectStore.delete(clip.getStoragePath());
+                clip.markDeleted(clock.instant());
+                pass.deleted++;
+            } catch (RuntimeException e) {
+                pass.failed++;
+                if (pass.failed <= RETENTION_FAILURES_LOGGED) {
+                    log.warn("Retention could not remove speaking clip {}: {}", clip.getId(), e.getMessage());
+                } else {
+                    log.debug("Retention could not remove speaking clip {}: {}", clip.getId(), e.getMessage());
+                }
+            }
+        }
+        return batch.size() == RETENTION_BATCH;
+    }
+
+    /** Where a retention run has got to, and what it has done so far. */
+    private static final class RetentionPass {
+        private final Instant deadline;
+        private Instant afterTime = Instant.EPOCH;
+        private UUID afterId = FIRST_ID;
+        private int deleted;
+        private int failed;
+        private boolean outOfTime;
+
+        private RetentionPass(Instant deadline) {
+            this.deadline = deadline;
+        }
+    }
+
     private void closeAbandoned(SpeechRecording clip, String reason) {
         long size;
         try {
@@ -334,6 +420,7 @@ public class SpeechRecordingService {
         Specification<SpeechRecording> spec = (root, query, cb) -> {
             List<Predicate> where = new ArrayList<>();
             where.add(cb.equal(root.get(hosted ? "hostId" : "participantUserId"), user.userId()));
+            where.add(cb.isNull(root.get("deletedAt")));
             if (date != null) {
                 where.add(cb.like(root.get("storagePath"), FOLDER_DATE.format(date) + "/%"));
             }
@@ -407,6 +494,11 @@ public class SpeechRecordingService {
         if (clip.getStatus() != SpeechRecording.Status.COMPLETED && clip.getStatus() != SpeechRecording.Status.INCOMPLETE) {
             throw new ApiException(ErrorCode.CONFLICT, "This recording has no file to play.");
         }
+        // Its object may be gone before the row is updated (the S3 lifecycle rule runs on its own): say so now, rather
+        // than hand out a link that ends in a storage error page.
+        if (objectStore.enabled() && !objectStore.exists(clip.getStoragePath())) {
+            throw new ApiException(ErrorCode.NOT_FOUND, "This recording is no longer available.");
+        }
         Instant expiresAt = clock.instant().plus(accessTtl);
         long expires = expiresAt.getEpochSecond();
         String url = publicUrl + CONTENT_PATH.replace("{id}", clip.getId().toString())
@@ -427,7 +519,8 @@ public class SpeechRecordingService {
         if (clock.instant().getEpochSecond() > expires) {
             throw ApiException.forbidden("This link has expired.");
         }
-        SpeechRecording clip = recordings.findById(recordingId).orElseThrow(() -> ApiException.notFound("Recording"));
+        SpeechRecording clip = recordings.findById(recordingId).filter(r -> !r.isDeleted())
+                .orElseThrow(() -> ApiException.notFound("Recording"));
         if (objectStore.enabled()) {
             // The bucket is private: the browser is sent on to a presigned URL valid no longer than this link.
             Duration ttl = Duration.ofSeconds(Math.max(1, Math.min(accessTtl.toSeconds(),
@@ -447,6 +540,7 @@ public class SpeechRecordingService {
     /** The clip, if this user may see it (its meeting's host, or the participant it belongs to); 404 otherwise. */
     private SpeechRecording authorized(UUID recordingId, CurrentUser user) {
         return recordings.findById(recordingId)
+                .filter(r -> !r.isDeleted())
                 .filter(r -> user.userId().equals(r.getHostId()) || user.userId().equals(r.getParticipantUserId()))
                 .orElseThrow(() -> ApiException.notFound("Recording"));
     }

@@ -2,6 +2,7 @@ package com.example.meetplatform.support;
 
 import com.example.meetplatform.common.storage.ObjectStorage;
 import com.example.meetplatform.media.service.MediaService;
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -11,6 +12,9 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import tools.jackson.databind.json.JsonMapper;
+
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 
 /**
  * Full application context against a real PostgreSQL schema built by Flyway.
@@ -35,6 +39,12 @@ public abstract class AbstractIntegrationTest {
 
     @Autowired
     protected JsonMapper json;
+
+    /** Objects exist unless a test says otherwise (ObjectStorage is a mock here). */
+    @BeforeEach
+    void objectsExist() {
+        when(storage.exists(anyString(), anyString())).thenReturn(true);
+    }
 
     @DynamicPropertySource
     static void database(DynamicPropertyRegistry registry) {

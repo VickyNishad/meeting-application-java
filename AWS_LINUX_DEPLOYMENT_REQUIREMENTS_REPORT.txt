@@ -1,0 +1,357 @@
+MEETLY - AWS LINUX DEPLOYMENT REQUIREMENTS (MINIMAL SETUP FOR A SMALL SERVER)
+Report date: 2026-11-05
+Based on: docker-compose.yml, .env.example, infra/caddy/Caddyfile, docs/07-deployment.md, and memory measured on
+the running application. No application code was changed.
+
+
+==========================================================================================
+1. SHORT ANSWER
+==========================================================================================
+Your application runs in Docker, so the server needs very little installed on it.
+
+  MUST install on the server:   Docker Engine + Docker Compose plugin (+ Git to get the code)
+  DO NOT install on the server: Java, Maven, Node.js, nginx, PostgreSQL, Redis (they all run inside containers)
+
+  MUST have outside the server: a domain name, an Elastic IP, an AWS Security Group, and a real e-mail (SMTP) service
+
+  Minimum recommended machine:  t3.medium (2 vCPU, 4 GB RAM), 40 GB gp3 disk, Ubuntu 24.04 LTS, x86_64
+  With this machine:            meetings, chat, permissions and speaking clips work.
+                                Cloud (whole-meeting) recording is left OFF, because it needs a bigger machine.
+
+
+==========================================================================================
+2. MACHINE SIZE
+==========================================================================================
+Option         Instance             vCPU  RAM    Disk       Use it for
+-------------  -------------------  ----  -----  ---------  ---------------------------------------------
+Demo only      t3.small             2     2 GB   30 GB      Short tests only. Needs 2 GB swap. Not for real use.
+MINIMUM        t3.medium            2     4 GB   40 GB      Small real use, without cloud recording.
+Better         t3.large             2     8 GB   60 GB      More meetings and more stability. No cloud recording.
+With cloud     t3.xlarge or         4     16 GB  100 GB     Cloud recording on. One recording needs 2-4 vCPU.
+recording      m6i.xlarge
+
+How many people? This has NOT been measured. docs/08-performance-testing.md says no load test has been run.
+As a rough estimate only, t3.medium should handle about 1-2 meetings of 5-10 people at the same time.
+Run a real test with your own meetings before you promise any number.
+
+Important about t3 machines: t3 is "burstable". Under long, heavy CPU use it spends CPU credits. Keep the credit
+setting on "unlimited" (the t3 default), otherwise video quality drops when credits run out. "Unlimited" can add cost.
+
+Use x86_64, not ARM: the backend and web images are built on your PC for x86_64. The LiveKit, egress and MinIO images
+do support ARM, but the x86_64 path is simpler for now.
+
+Memory measured on this application (idle, no meeting running):
+  backend         612 MB     (Compose limit 2 GB; Java can use up to 1.5 GB of heap under load)
+  minio            80 MB
+  postgres         34 MB
+  web (nginx)      13 MB
+  redis             7 MB
+  pg-backup         1 MB
+  Total measured  about 750 MB
+  Not measured: LiveKit and Caddy, plus Linux and Docker themselves. Estimated at about 500-700 MB together.
+  Expected idle total: about 1.3-1.5 GB. Memory and CPU grow with each meeting, mainly in LiveKit.
+  This is why 2 GB is too small for real use, and 4 GB is the practical minimum.
+
+
+==========================================================================================
+3. MANDATORY: AWS SIDE
+==========================================================================================
+1. EC2 instance (see section 2). Region close to your users (for India: ap-south-1, Mumbai).
+
+2. Elastic IP: MANDATORY. LiveKit tells browsers this address for audio and video. If the IP changes after a restart,
+   media stops working.
+
+3. Security Group. Open ONLY these ports:
+
+   Port             Protocol   From        Used for
+   ---------------  ---------  ----------  ------------------------------------------------
+   22               TCP        YOUR IP     SSH (never 0.0.0.0/0)
+   80               TCP        Anywhere    Let's Encrypt certificate and redirect to HTTPS
+   443              TCP        Anywhere    Website, API, LiveKit signalling
+   443              UDP        Anywhere    HTTP/3 (optional)
+   7881             TCP        Anywhere    Media fallback when UDP is blocked
+   50000-50100      UDP        Anywhere    Audio and video
+   3478             UDP        Anywhere    TURN relay
+
+   KEEP CLOSED (do not add these): 3000, 7880, 5432, 5050, 6379, 8080, 8025, 9000, 9001.
+
+   Warning: Compose publishes 3000 and 7880 on all network interfaces, and Docker bypasses Linux firewalls such as ufw.
+   So the AWS Security Group is your real protection here. Do not rely on ufw.
+
+   Port range note: 50000-50100 is 101 ports. Each participant uses about 2, so this is a limit of roughly 50 people
+   at once (estimate). It is enough for this machine. Use exactly this range in .env on the server: your Windows
+   .env may use a different one.
+
+4. Disk: EBS gp3. Turn on automatic EBS snapshots (AWS Data Lifecycle Manager). The nightly database backup is
+   written to the same disk, so without snapshots a disk failure loses both the data and the backup.
+
+
+==========================================================================================
+4. MANDATORY: OUTSIDE THE SERVER
+==========================================================================================
+1. Domain name: MANDATORY. Browsers allow camera and microphone only on HTTPS, and HTTPS needs a domain.
+   You need 2 DNS "A" records, both pointing to the Elastic IP. Example:
+       meet.example.com
+       s3.meet.example.com      (used for recordings and shared-file downloads)
+   Route 53 or any other DNS provider works. Create them BEFORE the first start, or the certificate will fail.
+
+2. HTTPS certificate: no purchase and no separate install. Caddy, included in docker-compose.yml, gets and renews free
+   Let's Encrypt certificates automatically.
+
+3. Real e-mail (SMTP): MANDATORY. The production profile forces e-mail verification, so without real mail new users
+   cannot verify their account. Mailpit only catches mail for local testing and does not deliver it.
+   Options: Amazon SES (new accounts start in "sandbox" mode: request production access) or any SMTP provider.
+   Use port 587 with SMTP_AUTH=true and SMTP_STARTTLS=true. AWS restricts port 25 on EC2.
+   APP_MAIL_FROM must be an address your provider has verified.
+
+
+==========================================================================================
+5. MANDATORY: SOFTWARE ON THE SERVER
+==========================================================================================
+Recommended OS: Ubuntu 24.04 LTS. Docker's official repository gives Docker, Compose and Buildx in one step.
+
+Install (Ubuntu 24.04):
+   sudo apt-get update
+   sudo apt-get install -y ca-certificates curl git
+   curl -fsSL https://get.docker.com | sudo sh
+   sudo usermod -aG docker $USER        (then log out and log in again)
+   docker compose version               (must show v2.x)
+
+If you use Amazon Linux 2023: its "docker" package does NOT include the Compose plugin or a current Buildx, so both must
+be installed by hand. This is why Ubuntu is recommended.
+
+Add swap (needed on small machines, 2 GB is enough on 4 GB RAM):
+   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+   sudo mkswap /swapfile && sudo swapon /swapfile
+   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+That is all. Nothing else must be installed on the server.
+
+Downloaded inside Docker automatically:
+   Service       Image                     Size      Needed?
+   ------------  ------------------------  --------  ----------------------------------------------
+   postgres      postgres:17-alpine        424 MB    MANDATORY   database
+   pg-backup     postgres:17-alpine        (same)    MANDATORY   nightly backup, keeps 14 days
+   redis         redis:7.4-alpine          58 MB     MANDATORY   LiveKit coordination, rate limits
+   minio         pgsty/minio               216 MB    MANDATORY   shared files, cloud recording storage
+   livekit       livekit-server v1.13.11   132 MB    MANDATORY   audio and video
+   backend       your Java API             512 MB    MANDATORY
+   web           your React app + nginx    84 MB     MANDATORY
+   caddy         caddy:2.10-alpine         83 MB     MANDATORY   HTTPS
+   Total about 1.5 GB of images.
+
+   egress        livekit/egress            3.83 GB   SKIP on small server (needs 4 vCPU / 4 GB)
+   mailpit       axllent/mailpit           51 MB     SKIP (testing only, use real SMTP)
+   pgadmin       dpage/pgadmin4            791 MB    SKIP (database admin UI, a security risk on a server)
+   prometheus, grafana, jaeger                       SKIP (optional monitoring, off by default)
+
+
+==========================================================================================
+6. SERVER .ENV: VALUES THAT MUST BE DIFFERENT FROM YOUR PC
+==========================================================================================
+.env is not in Git, on purpose. Create it on the server with: cp .env.example .env ; chmod 600 .env
+
+Generate NEW secrets on the server. Do not copy the ones from your PC. For each secret: openssl rand -base64 32
+   APP_JWT_SECRET, POSTGRES_PASSWORD, REDIS_PASSWORD, LIVEKIT_API_SECRET, S3_SECRET_KEY, PGADMIN_DEFAULT_PASSWORD
+   LIVEKIT_API_KEY and S3_ACCESS_KEY: any new random value.
+   PGADMIN_DEFAULT_PASSWORD must be set even though pgAdmin is not started, or Compose refuses to run.
+
+Replace meet.example.com with your domain and 1.2.3.4 with your Elastic IP:
+
+   SPRING_PROFILES_ACTIVE=prod
+   APP_PUBLIC_URL=https://meet.example.com
+   APP_CORS_ALLOWED_ORIGINS=https://meet.example.com
+   APP_CALENDAR_CALLBACK_BASE_URL=https://meet.example.com
+   SITE_DOMAIN=meet.example.com
+   S3_DOMAIN=s3.meet.example.com
+   S3_PUBLIC_ENDPOINT=https://s3.meet.example.com
+   S3_BIND_ADDRESS=127.0.0.1
+   LIVEKIT_PUBLIC_URL=wss://meet.example.com
+   LIVEKIT_NODE_IP=1.2.3.4
+   LIVEKIT_USE_EXTERNAL_IP=false
+   LIVEKIT_RTC_PORT_START=50000
+   LIVEKIT_RTC_PORT_END=50100
+   LIVEKIT_TURN_ENABLED=true
+   LIVEKIT_TURN_DOMAIN=meet.example.com
+   DATA_ROOT=/srv/meetly
+   RECORDING_STORAGE_TYPE=S3
+   AWS_REGION=ap-south-1
+   AWS_S3_BUCKET=<your bucket name>
+   AWS_S3_PREFIX=speaking-clips
+   AWS_ACCESS_KEY_ID=          (leave empty when using an IAM role)
+   AWS_SECRET_ACCESS_KEY=      (leave empty when using an IAM role)
+   RECORDING_LOCAL_PATH=/srv/meetly/Recordings
+   APP_COOKIE_SECURE=true
+   APP_REQUIRE_EMAIL_VERIFICATION=true
+   APP_OPENAPI_ENABLED=false
+   APP_MAIL_FROM=no-reply@meet.example.com
+   SMTP_HOST=email-smtp.ap-south-1.amazonaws.com     (example for Amazon SES)
+   SMTP_PORT=587
+   SMTP_USERNAME=<from your provider>
+   SMTP_PASSWORD=<from your provider>
+   SMTP_AUTH=true
+   SMTP_STARTTLS=true
+
+RECORDING_STORAGE_TYPE: S3 sends finished speaking clips to your AWS S3 bucket. See section 11 for the bucket, the IAM
+role, and what S3 does and does not cover.
+
+Linux folder permission (does NOT happen on Windows): the backend runs as user id 100, so it must own the clip folder,
+or saving speaking clips fails:
+   sudo mkdir -p /srv/meetly/Recordings /srv/meetly/backups /srv/meetly/minio /srv/meetly/redis
+   sudo chown -R 100:101 /srv/meetly/Recordings
+
+
+==========================================================================================
+7. DEPLOY STEPS
+==========================================================================================
+1. Create the EC2 instance, Elastic IP, Security Group and 2 DNS records (sections 3 and 4).
+2. Install Docker and add swap (section 5).
+3. Get the code. The GitHub repository is VickyNishad/meeting-application-java, branch main. It is up to date with
+   your PC (commit 71ca2d3). If the repository is private, the server needs a deploy key or access token.
+      git clone https://github.com/VickyNishad/meeting-application-java.git
+      cd meeting-application-java
+4. Create .env and the folders (section 6).
+5. Build the images. This is the heaviest step: Maven and npm can run out of memory on a small server.
+   Option A, build on the server (simple, needs swap, slow):
+      docker compose build backend web
+   Option B, build on your PC and copy (safer for small servers; it must be built as x86_64):
+      On PC:     docker save meet-platform-backend meet-platform-web | gzip > meetly-images.tar.gz
+                 Copy the file to the server with scp.
+      On server: gunzip -c meetly-images.tar.gz | docker load
+6. Start ONLY the needed services:
+      docker compose --profile tls up -d --no-build postgres pg-backup redis minio livekit backend web caddy
+   Warning: do NOT run plain "docker compose up -d". It also starts egress, pgadmin and mailpit, and egress can take
+   4 GB of RAM and 4 vCPU.
+7. Check:
+      docker compose ps                 (all "Up", backend "healthy")
+      docker compose logs -f caddy      (certificate obtained)
+8. Test from 2 different networks (for example Wi-Fi and mobile data), using section 8.
+
+
+==========================================================================================
+8. CHECK AFTER DEPLOY
+==========================================================================================
+[ ] https://your-domain opens with a valid lock icon
+[ ] Registration e-mail really arrives and the link verifies the account
+[ ] Two people on different networks see and hear each other
+[ ] Screen sharing works (the meeting must be "Video"; "Voice only" meetings hide it by design)
+[ ] Chat works and a shared file downloads (this uses the s3. domain)
+[ ] Host permissions work (restrict a microphone)
+[ ] In a meeting with "Record automatically", a speaking clip appears and plays
+[ ] Ports 3000, 7880, 5432, 6379, 8080, 9000 are NOT reachable from the internet
+[ ] After a server reboot, everything comes back by itself
+[ ] A database backup appears in /srv/meetly/backups the next day, and one test restore works
+
+
+==========================================================================================
+9. KNOWN RISKS AND LIMITS
+==========================================================================================
+1. Cloud recording does not work yet. On your PC all 81 cloud recordings ended FAILED with "Start signal not received".
+   The cause has NOT been investigated, so moving to a server may or may not fix it.
+   Speaking clips use a different path and do work.
+2. Side effect of skipping egress: "Record automatically" is also what turns on speaking clips. In those meetings, when
+   someone speaks, the app will try to start a cloud recording and leave a FAILED row in the recordings list (at most
+   one per room every 5 minutes). Clips still save. If you do not want these rows, the cause must be fixed or the
+   behaviour changed in code, which is outside this report.
+3. One server means one point of failure. If it stops, all meetings stop.
+4. Very strict office networks: Compose has TURN on UDP 3478 only, and media uses UDP or TCP 7881. Networks that allow
+   only port 443 may not connect. TURN over TLS would need a certificate and a Compose change.
+5. Capacity is not load-tested (section 2).
+6. Storage growth: speaking clips measured about 72 KB per second with video, so about 260 MB per hour of speech. They go
+   to S3, so check the S3 bill. Also watch free server disk: it still holds the database, shared files and staging clips.
+7. Application items still open before real users:
+   - Independent re-check of the host media-permission fixes was never completed.
+   - UI findings R1-R4 are not fixed (see MEETING_ROOM_UI_REDESIGN_REPORT.txt).
+   - Recording note L1 is not fixed (see RECORDING_SILENCE_FIX_REPORT.txt).
+
+
+==========================================================================================
+10. APPROXIMATE MONTHLY COST
+==========================================================================================
+Estimates only, from memory of AWS list prices, for 24x7 use. Confirm with the AWS Pricing Calculator.
+
+   t3.medium instance                      about $30-35
+   40 GB gp3 disk                          about $4
+   Public IPv4 (Elastic IP)                about $4
+   Domain                                  about $1 (paid yearly)
+   Data transfer out                       first 100 GB free, then about $0.09-0.11 per GB
+   Total before heavy traffic              about $40-45 per month
+
+Data transfer can become the largest cost, because media leaves the server for every viewer. Rough estimates:
+   5 people, voice only, 1 hour     about 0.5 GB
+   5 people, video, 1 hour          about 4-5 GB
+
+
+==========================================================================================
+11. USING AWS S3 FOR MEDIA, AND WHERE THE DATABASE GOES
+==========================================================================================
+Updated because you use AWS S3. Your application has three kinds of stored data, and they do not work the same way:
+
+   Data                       Where it goes                     Change needed?
+   -------------------------  --------------------------------  -----------------------------------------------
+   Speaking clips             AWS S3                            NO. Only .env settings (section 6).
+   Shared chat files          MinIO on the server (default)     Moving to AWS S3 needs a Compose change (below).
+   Cloud meeting recordings   MinIO on the server (default)     Not used on the small server (egress is off).
+   Database (PostgreSQL)      Server disk (EBS)                 CANNOT go on S3 (see "Database" below).
+
+MinIO stays mandatory in the minimal setup: the backend waits for it at startup, and it stores shared chat files. It
+uses only about 80 MB of RAM. Keep the s3.meet.example.com DNS record, because shared-file downloads use it.
+
+
+S3 SETUP FOR SPEAKING CLIPS (mandatory steps)
+1. Create the bucket yourself. The application never creates this one.
+   Bucket names are global, so choose a unique one. Use the same region as the server.
+   Keep "Block all public access" ON and default encryption ON.
+2. Create an IAM role for the EC2 instance. This is safer than access keys, so leave the AWS_ACCESS_KEY_ID and
+   AWS_SECRET_ACCESS_KEY values empty. Replace the bucket name and prefix:
+      s3:PutObject, s3:GetObject   on   arn:aws:s3:::<bucket>/<prefix>/*
+      s3:ListBucket                on   arn:aws:s3:::<bucket>
+3. Set the instance metadata hop limit to 2. MANDATORY: containers cannot reach the IAM role without it.
+      aws ec2 modify-instance-metadata-options --instance-id <id> --http-put-response-hop-limit 2 --http-endpoint enabled
+4. Set the .env values in section 6.
+5. Keep the folder step in section 6: clips are first written to /srv/meetly/Recordings (staging) and uploaded when the
+   clip is finished, so this folder and its owner (100:101) are still mandatory.
+6. Check: speak in a "Record automatically" meeting, then confirm the file appears in the bucket and plays in the app.
+   If the bucket is missing or not reachable, clips stay in RECORDING state and the upload retries every minute. The
+   backend log shows the error.
+
+How it was tested: the S3 clip path has automated tests against an S3-compatible server. It has NOT yet been run
+against real AWS S3 with an IAM role, so step 6 is important.
+
+If you switch from LOCAL later: clips saved before the switch stay on disk and stop playing until you copy them once:
+      aws s3 sync <RECORDING_LOCAL_PATH> s3://<bucket>/<prefix> --exclude "*.part"
+
+
+OPTIONAL: SHARED CHAT FILES ON AWS S3 TOO
+This is not possible with .env alone. docker-compose.yml fixes the storage address to http://minio:9000 and does not
+pass the region or files-bucket settings to the backend. It would need a server-side docker-compose.override.yml, plus
+these limits:
+   - This path supports access keys only, not an IAM role, so you would need an IAM user with keys.
+   - You would create 2 uniquely named buckets (meet-recordings and meet-files are probably already taken).
+   - It has never been tested against real AWS S3.
+Recommendation: start with shared files on MinIO, and move them later if you need to.
+
+
+DATABASE
+S3 cannot run a database. It stores whole files, and PostgreSQL needs a real disk. You have 2 choices:
+
+   Choice A, PostgreSQL on the server (recommended for a small server, already included):
+      - Runs as a container on the EBS disk. No code change and no extra cost.
+      - S3 can hold the BACKUPS. The nightly dump is in /srv/meetly/backups; to copy it to S3, install the AWS CLI on the
+        server and add a daily cron job. The IAM role also needs s3:PutObject on the backup location:
+           aws s3 sync /srv/meetly/backups s3://<bucket>/db-backups
+      - The AWS CLI is needed only for this copy.
+
+   Choice B, Amazon RDS for PostgreSQL 17 (managed database, more cost):
+      - AWS handles backups and patching. Roughly $15-30 per month extra for the smallest size (estimate).
+      - docker-compose.yml fixes the database address, so this also needs a server-side override file, and the backend
+        must stop waiting for the local postgres container.
+      - Saves about 35 MB of idle RAM, so it does not help a small server much.
+
+Recommendation: Choice A, with dumps copied to S3.
+
+
+COST ADDED BY S3 (estimate, confirm with the AWS Pricing Calculator)
+   Storage: about $0.025 per GB per month.
+   Example: 100 hours of speech is about 26 GB, so about $0.65 per month.
+   Downloads and playback count as data transfer out (section 10).

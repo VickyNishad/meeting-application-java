@@ -267,6 +267,12 @@ export const chatApi = {
       headers: participantHeaders(waitToken),
     });
   },
+  deleteFile: (meetingId: string, fileId: string, participantId: string, waitToken?: string) =>
+    api.delete<void>(`/meetings/${enc(meetingId)}/files/${enc(fileId)}`, {
+      query: { participantId },
+      auth: 'optional',
+      headers: participantHeaders(waitToken),
+    }),
   fileUrl: (meetingId: string, fileId: string, waitToken?: string) =>
     api.post<SignedUrl>(`/meetings/${enc(meetingId)}/files/${enc(fileId)}/download-url`, undefined, {
       auth: 'optional',

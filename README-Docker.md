@@ -77,14 +77,14 @@ then run `wsl --shutdown` and restart Docker Desktop.
 - **Disk:** *Settings > Resources > Advanced > Disk image location*. Move it to `D:\` to keep PostgreSQL data off
   the system drive (the database volume lives in that disk image).
 - **File sharing:** the compose file bind-mounts `DATA_ROOT` (default `./docker` next to `docker-compose.yml`) for
-  backups, Redis, MinIO and recordings. These folders are git-ignored. Set `DATA_ROOT` in `.env` to put them
+  backups, Redis and clips (MinIO too, with `--profile minio`); shared files go to `./storage`. These folders are git-ignored. Set `DATA_ROOT` in `.env` to put them
   elsewhere (e.g. `D:/meetly/docker`).
 
 ## 3. What is in the project
 
 ```
 Meeting/
-├── docker-compose.yml          all services (postgres, pgadmin, redis, minio, mailpit, livekit, egress, backend, web, ...)
+├── docker-compose.yml          all services (postgres, pgadmin, redis, livekit, backend, web; minio and egress are optional profiles)
 ├── .env.example                every setting with placeholders  -> copy to .env
 ├── .env                        your local secrets (never committed; .gitignore excludes it)
 ├── docker/
@@ -152,7 +152,7 @@ passes. The check connects over TCP (`pg_isready -h 127.0.0.1`), so it only pass
 really connect, also on the very first start while the database is being initialised. The web app waits for the
 API's readiness check.
 
-Full stack URLs: web app <http://localhost:3000>, mail <http://localhost:8025>, pgAdmin <http://localhost:5050>.
+Full stack URLs: web app <http://localhost:3000>, pgAdmin <http://localhost:5050>.
 
 ### Upgrading from an earlier version of docker-compose.yml
 
@@ -202,7 +202,7 @@ docker-compose.yml). The API listens on 8080 inside the network only; the web co
 
 Profiles: the backend runs the `prod` Spring profile unless `.env` sets `SPRING_PROFILES_ACTIVE` (empty = no
 profile, which honours `APP_COOKIE_SECURE` / `APP_OPENAPI_ENABLED` for plain-http local use). Do not use `dev` in
-Docker: it stores files on the container's local disk instead of MinIO.
+Docker. Choose storage with `STORAGE_PROVIDER` instead (`docs/07-deployment.md`): `local` needs no AWS or MinIO.
 
 Health: `docker compose ps` shows `backend` as *healthy* once `/actuator/health/readiness` is UP (it checks the
 database).
@@ -399,13 +399,13 @@ Optional tools stay out of docker-compose.yml so a normal start runs only what t
 This setup is for local development:
 
 - `.env` holds real secrets: it is in `.gitignore`; only `.env.example` (placeholders) is shared.
-- PostgreSQL, pgAdmin, Redis, the API (8080), MinIO (9000, 9001) and the other admin ports are bound to
+- PostgreSQL, pgAdmin, Redis, the API (8080), MinIO (9000, 9001, only with `--profile minio`) and the other admin ports are bound to
   `127.0.0.1`. Reachable from the network are only what browsers need: the web app (3000) and LiveKit (7880, 7881,
   UDP 50000-50100, TURN UDP 3478). Set `S3_BIND_ADDRESS=0.0.0.0` if other devices must download recordings
   directly from MinIO.
 - The backend runs the `prod` Spring profile by default. The local `.env` sets `SPRING_PROFILES_ACTIVE=` (empty)
   so that plain-http cookies and Swagger work on this PC.
-- Runtime data (`docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings`) is git-ignored: database
+- Runtime data (`docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings`, `storage`) is git-ignored: database
   dumps contain user data and must never be committed.
 - All services share one private bridge network (`meet-platform-net`) and talk by service name.
 - The API container runs as the non-root user `app`. Other images run as their image's default user (nginx and

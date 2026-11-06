@@ -103,6 +103,11 @@ final class SpeechClipFlow {
         return read(finish(who, id, chunks).andExpect(status().isOk()));
     }
 
+    /** The dashboard's access-url call as the host, for tests that expect it to fail. */
+    ResultActions requestAccess(String clipId) throws Exception {
+        return mvc.perform(post("/api/v1/speech-recordings/" + clipId + "/access-url").header("Authorization", host.bearer()));
+    }
+
     /** The signed content URL from the dashboard's access-url call, as a path + query usable with MockMvc. */
     String accessPath(String clipId, boolean download) throws Exception {
         String url = read(mvc.perform(post("/api/v1/speech-recordings/" + clipId + "/access-url")

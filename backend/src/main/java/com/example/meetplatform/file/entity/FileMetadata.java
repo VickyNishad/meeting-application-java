@@ -59,6 +59,14 @@ public class FileMetadata extends BaseEntity {
         this.createdAt = createdAt;
     }
 
+    public UUID getUploadedByParticipantId() {
+        return uploadedByParticipantId;
+    }
+
+    public void markDeleted(Instant now) {
+        deletedAt = now;
+    }
+
     public UUID getMeetingId() {
         return meetingId;
     }

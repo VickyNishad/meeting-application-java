@@ -810,6 +810,7 @@ export function RoomView({
       setHand,
       waitingCount,
       cloudRecording: state.cloudRecording,
+      cloudRecordingAvailable: state.cloudRecordingAvailable,
       localRecorders: state.localRecorders,
       names: state.names,
       presentCount: state.loaded ? state.presentCount : null,
@@ -821,7 +822,7 @@ export function RoomView({
     }),
     // Field by field: a buffered or duplicate signal that changes nothing visible must not re-render the room.
     [meeting, join, myRole, isModerator, stageOnly, state.stageIdentities, state.locked, state.screenSharePolicy,
-      state.waitingRoomEnabled, state.chatEnabled, state.roleOverrides, state.raisedHands, state.cloudRecording,
+      state.waitingRoomEnabled, state.chatEnabled, state.roleOverrides, state.raisedHands, state.cloudRecording, state.cloudRecordingAvailable,
       state.localRecorders, state.names, state.loaded, state.presentCount, state.mediaPermissions, state.participantMedia,
       audienceRooms, setHand, waitingCount, finish,
       setters],

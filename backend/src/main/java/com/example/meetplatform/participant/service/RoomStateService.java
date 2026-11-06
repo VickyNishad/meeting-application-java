@@ -1,5 +1,6 @@
 package com.example.meetplatform.participant.service;
 
+import com.example.meetplatform.common.config.AppProperties;
 import com.example.meetplatform.common.exception.ApiException;
 import com.example.meetplatform.common.exception.ErrorCode;
 import com.example.meetplatform.common.security.CurrentUser;
@@ -53,12 +54,15 @@ public class RoomStateService {
     private final RateLimiter rateLimiter;
     private final ParticipantPolicy policy;
     private final MediaService media;
+    private final AppProperties properties;
     private final Clock clock;
 
     public RoomStateService(MeetingRepository meetings, MeetingParticipantRepository participants,
                             RoomSessionService roomSessions, ParticipantAccessService participantAccess,
                             MeetingRecordingLookup recordings, RoomSequence sequence, RoomAudience audience,
-                            RateLimiter rateLimiter, ParticipantPolicy policy, MediaService media, Clock clock) {
+                            RateLimiter rateLimiter, ParticipantPolicy policy, MediaService media,
+                            AppProperties properties, Clock clock) {
+        this.properties = properties;
         this.policy = policy;
         this.media = media;
         this.meetings = meetings;
@@ -108,7 +112,8 @@ public class RoomStateService {
                 stageIdentities, meeting.isLocked(), meeting.isChatEnabled(), meeting.getScreenSharePolicy(),
                 meeting.isWaitingRoomEnabled(), recordings.isRecording(meetingId), meeting.isAutoRecord(),
                 localRecorders, hands, waiting, names, audience.visibleCount(meeting, room.getId(), viewer),
-                policy.mediaPermissions(meeting), policy.participantMedia(meeting, viewer), participantMedia);
+                policy.mediaPermissions(meeting), policy.participantMedia(meeting, viewer), participantMedia,
+                properties.recording().cloudEnabled());
     }
 
     /**

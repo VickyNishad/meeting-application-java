@@ -58,10 +58,10 @@ public class DashboardService {
                 LIMIT ?
                 """, (rs, i) -> highlight(rs.getObject("meeting_id", UUID.class), rs.getString("title"),
                 instant(rs.getTimestamp("last_spoke_at"))), user.userId(), HIGHLIGHT_MEETINGS);
-        // Speaking clips of the meetings the user hosts that have a file (COMPLETED or INCOMPLETE).
+        // Speaking clips of the meetings the user hosts that still have a file: not those removed by retention.
         long[] clips = jdbc.queryForObject("""
                 SELECT count(*), coalesce(sum(file_size), 0) FROM speech_recordings
-                WHERE host_id = ? AND status IN ('COMPLETED', 'INCOMPLETE')
+                WHERE host_id = ? AND status IN ('COMPLETED', 'INCOMPLETE') AND deleted_at IS NULL
                 """, (rs, i) -> new long[] {rs.getLong(1), rs.getLong(2)}, user.userId());
         return new DashboardSummary(recent, inProgress == null ? 0 : inProgress, storage == null ? 0 : storage,
                 highlights, clips[0], clips[1]);

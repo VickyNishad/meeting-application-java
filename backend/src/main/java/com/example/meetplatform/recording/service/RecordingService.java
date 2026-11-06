@@ -124,6 +124,9 @@ public class RecordingService {
 
     @Transactional(noRollbackFor = ApiException.class)
     public RecordingView start(UUID meetingId, StartRecordingRequest request, CurrentUser user) {
+        if (!properties.recording().cloudEnabled()) {
+            throw new ApiException(ErrorCode.CONFLICT, "Cloud recording is not enabled on this server.");
+        }
         ModeratorContext ctx = moderation.resolveModerator(meetingId, user, MeetingPermissions.RECORD, true);
         MeetingRoom room = ctx.room();
         if (!recordings.findByRoomIdAndKindAndStatusIn(room.getId(), Recording.KIND_CLOUD, Recording.IN_FLIGHT)
@@ -435,10 +438,14 @@ public class RecordingService {
                 || organizations.isAdmin(meeting.getOrganizationId(), user.userId());
     }
 
-    private static void requireAvailable(Recording recording) {
+    private void requireAvailable(Recording recording) {
         if (recording.getStatus() != Recording.Status.AVAILABLE) {
             throw new ApiException(ErrorCode.CONFLICT, "The recording is not available yet (status "
                     + recording.getStatus() + ").");
+        }
+        // Available in the database, but its object may be gone: say so now instead of handing out a dead link.
+        if (!storage.exists(properties.storage().recordingsBucket(), recording.getStorageKey())) {
+            throw new ApiException(ErrorCode.NOT_FOUND, "This recording's file is no longer available.");
         }
     }
 

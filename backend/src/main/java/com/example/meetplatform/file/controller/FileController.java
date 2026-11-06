@@ -8,6 +8,7 @@ import com.example.meetplatform.participant.controller.ParticipantController;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -57,5 +58,13 @@ public class FileController {
                                                   @RequestHeader(value = ParticipantController.PARTICIPANT_TOKEN_HEADER,
                                                           required = false) String token) {
         return service.downloadUrl(meetingId, fileId, participantId, token, currentUser.current());
+    }
+
+    @DeleteMapping("/{fileId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable UUID meetingId, @PathVariable UUID fileId, @RequestParam UUID participantId,
+                       @RequestHeader(value = ParticipantController.PARTICIPANT_TOKEN_HEADER, required = false)
+                       String token) {
+        service.delete(meetingId, fileId, participantId, token, currentUser.current());
     }
 }

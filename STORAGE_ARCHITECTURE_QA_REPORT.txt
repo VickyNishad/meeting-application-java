@@ -1,0 +1,518 @@
+STORAGE ARCHITECTURE QA REPORT - FINAL
+Independent QA review of uncommitted work. Report only: no source, config, test, data or volume was changed.
+Date: 2026-11-05
+Status: COMPLETE
+
+All paths are relative to D:\Meeting\meeting-application-java. B = backend/src/main/java/com/example/meetplatform.
+
+Evidence types used below:
+  SOURCE    source-code inspection, not executed
+  TEST      automated test (who ran it is stated)
+  REAL      real-service check on the local running stack (read-only)
+Nothing was tested against real AWS S3, a real IAM role or real Egress. MinIO-based tests are not AWS verification.
+Mocked Egress tests are not recording verification.
+
+
+======================================================================
+1. EXECUTIVE VERDICT
+======================================================================
+
+NOT READY FOR PRODUCTION. ACCEPTABLE FOR LOCAL WINDOWS DEVELOPMENT, except that F1 should be fixed in every environment.
+
+The structure is sound: provider switch, private bucket design, IAM role handling, server-side checks before signed
+links, cloud recording switch, migration V11 and path traversal protection all held up. Five things stop a go-live:
+  - a person removed from a meeting can still delete shared files, permanently (F1, proven by test)
+  - production can silently keep speaking clips on the server's disk (F2)
+  - the non-root container user may be unable to write its folders on Linux (F3, not run on Linux)
+  - the settings in the owner's current .env would misdirect S3 links and the recordings bucket if carried over (F6)
+  - nothing has been verified on real AWS (section 12)
+
+Counts
+  Severity:        CRITICAL 0, HIGH 3, MEDIUM 6, LOW 10 (19 findings)
+  Classification:  CONFIRMED DEFECT 8, POTENTIAL RISK 11, plus 7 DESIGN CHOICES listed separately
+  Label on the 19: FAIL 8, NEEDS VERIFICATION 10, NOT APPLICABLE 1
+  Label on the 7 design choices: PASS 6, NEEDS VERIFICATION 1
+
+Owner's 7 requirements
+  1. 90-day rule on speaking clips only        NEEDS VERIFICATION  Documented rule is correct, filtered on speaking-clips/ (SOURCE). Never applied to a bucket.
+  2. Shared files never deleted automatically  PASS                The only delete on filesBucket is FileService.java:185, a user action (SOURCE). Retention touches clips only.
+  3. Whole-meeting retention configurable      PASS                Separate setting and job (SOURCE). See design choice D5: an organization's default wins.
+  4. Database and S3 consistent                FAIL                Core paths are sound, but see F4, F5, F7, F10.
+  5. Expired or missing objects graceful       PASS                Files, recordings and S3 clips (TEST, developer run, MinIO or mocked storage). Small gaps in F12.
+  6. Cloud recording off by default            PASS                Manual and automatic starts gated (SOURCE; TEST with mocked provider). Not a real Egress check.
+  7. No MinIO removal before migration         PASS                Library, profile and docker/minio remain. No live row needs MinIO: 5 file rows are test data, all 115 recordings are FAILED (REAL, SELECT).
+
+
+======================================================================
+2. CRITICAL FINDINGS
+======================================================================
+
+None.
+
+
+======================================================================
+3. HIGH-PRIORITY FINDINGS
+======================================================================
+
+F1  HIGH  CONFIRMED DEFECT  FAIL
+Title: A person removed from a meeting can still delete shared files
+Code:  B/file/service/FileService.java:178-189 (delete calls participantAccess.resolve, line 179)
+       B/participant/service/ParticipantAccessService.java:57-67 (resolve checks identity only, not state)
+       B/participant/service/ParticipantAccessService.java:71-78 (resolvePresent, used by upload)
+       B/participant/entity/MeetingParticipant.java:176-180 (remove keeps the role)
+       B/moderation/service/ModerationService.java:261
+What goes wrong: resolve proves who the caller is, never whether they may still act. remove() changes the state but not
+the role, so a kicked co-host stays a moderator for this check, for good, and can erase every shared file in the
+meeting. Deletion is unrecoverable. It also works after the meeting has ended, and a guest's token stays valid because
+nothing rotates it on removal.
+Evidence: TEST, executed by QA. A temporary class in a scratch copy (not in the project), with its own database and
+mocked ObjectStorage: host promotes Bob to co-host, host removes Bob, Bob deletes Alice's file: 204, and storage.delete
+was called. A removed uploader deleting their own file: 204. Printed as "QA-RESULT removed co-host DELETE status=204"
+and "QA-RESULT removed uploader DELETE status=204". The project's FileDeleteIntegrationTest has no such case.
+
+Who can do what, by the caller's state (SOURCE, except the two rows marked TEST):
+  State                        Upload           List/download                     Delete
+  ADMITTED, JOINED             Yes (a)          Yes                               Uploader or moderator
+  LEFT                         No               Yes                               Uploader or moderator
+  LEFT, meeting ended          No               Yes                               Uploader or moderator, no meeting check
+  REMOVED, moderator role      No               Not as participant (b)            YES (TEST: 204). DEFECT
+  REMOVED, uploader            No               Not as participant (b)            YES (TEST: 204). DEFECT
+  REMOVED, neither             No               Not as participant (b)            No, 403
+  DENIED                       No               Not as participant (b)            Only if uploader or moderator; in practice no (c)
+  WAITING                      No               Not as participant (b)            Only if uploader or moderator; in practice no (c)
+  (a) Also needs FILE_SHARE, and in a stage-only meeting a moderator role.
+  (b) ParticipantAccessService.java:40-54: a participant must be wasAdmitted (ADMITTED, JOINED, LEFT). A signed-in user
+      then falls through to canView: host, system admin, invited, organization member or past participant. Whether
+      hasParticipated stays true for a removed user was not fully traced.
+  (c) A DENIED or WAITING row has never uploaded, and a moderator is admitted straight away (JoinService.java:112-172),
+      so no reachable path was found. Not executed.
+So delete is looser than both upload and download: it is the only one of the three with no state check at all.
+
+Required fix: in delete, require a state check. Suggested rule: refuse REMOVED and DENIED always, require resolvePresent
+for the moderator branch, and decide explicitly whether a LEFT uploader or an ended meeting may delete. Add tests.
+
+
+F2  HIGH  CONFIRMED DEFECT  FAIL
+Title: Production can silently keep speaking clips on the server's local disk
+Code:  B/recording/service/SpeechClipObjectStore.java:52-69 (warns only)
+       docker-compose.yml:256 RECORDING_STORAGE_TYPE: ${RECORDING_STORAGE_TYPE:-${STORAGE_PROVIDER:-}}
+       .env: RECORDING_STORAGE_TYPE=LOCAL (REAL, value read; not a secret)
+What goes wrong: prod refuses STORAGE_PROVIDER=local for files, but RECORDING_STORAGE_TYPE=LOCAL wins over
+STORAGE_PROVIDER=s3 for clips, and prod only logs a warning. The owner's .env has exactly this value, and
+docs/07-deployment.md's production row and implementation report section 7 step 3 do not say to clear it. Clips would
+then stay on the EC2 disk, deleteExpired returns 0 (objectStore.enabled() is false), the lifecycle rule has nothing to
+act on, and the disk fills until requireFreeSpace refuses recording.
+Evidence: SOURCE and REAL (.env value). Not executed in the prod profile.
+Required fix: refuse to start when the prod profile and STORAGE_PROVIDER=s3 meet RECORDING_STORAGE_TYPE=LOCAL, or keep
+an explicit override name. Add the setting to the production checklist.
+
+
+F3  HIGH  POTENTIAL RISK  NEEDS VERIFICATION (a Linux host was not available)
+Title: Non-root container user may not be able to write the bind mounts on Linux
+Code:  backend/Dockerfile (adduser -S app, USER app, no /data folder, no chown)
+       docker-compose.yml backend volumes, create_host_path: true for /data/recordings and /data/storage
+       B/common/storage/LocalFileObjectStorage.java:66-72 (failure throws in the constructor)
+       B/recording/service/SpeechClipStorage.java constructor (failure logged only), append (createDirectories)
+Facts checked (REAL): the container runs as uid=100(app) gid=101(app). docker inspect shows
+  bind D:/MeetingApplication/Recordings -> /data/recordings rw=true
+  bind D:\Meeting\meeting-application-java\storage -> /data/storage rw=true
+Inside the container both show drwxrwxrwx root root. docs/ and README-Docker.md contain no chown instruction (grep).
+
+Windows and Docker Desktop (development): PASS (REAL). Mounts appear world-writable, so owner does not matter. Stored
+files exist in storage/shared-files/files, and clips dated 2026-11-05 exist in the database.
+
+Linux host (reasoned, NOT EXECUTED): Docker creates a missing bind source as root:root 0755, and uid 100 cannot write
+it. The same applies to a folder owned by another user, such as ec2-user. Expected result:
+  STORAGE_PROVIDER=local   LocalFileObjectStorage cannot create shared-files, throws IllegalStateException: the backend
+                           fails at startup and restarts in a loop. No uploads at all.
+  STORAGE_PROVIDER=s3      The backend starts. Shared file upload and download are not affected: they do not use
+                           /data/storage. S3-mode clip staging is affected: SpeechClipStorage only logs at startup,
+                           start() creates the clip row, then every chunk fails in append with STORAGE_UNAVAILABLE.
+                           So all speaking clips are lost in production, with no startup failure, and the rows end
+                           FAILED through recovery.
+Related: .env.example's RECORDING_LOCAL_PATH=D:/MeetingApplication/Recordings is not a Linux path, and the production
+row of the docs does not say to change it. The /data/recordings mount predates this work. /data/storage is new.
+Note: the failed mkdir probe (section 14) shows uid 100 cannot write the root-owned 755 /data folder in the container.
+It does not prove the Linux bind mount result, which still needs a real Linux run.
+Required fix: document and script ownership for uid 100, or create the folders in the image and start with a fixed
+uid, then test on Linux. Make a staging folder failure visible at startup in S3 mode.
+
+
+======================================================================
+4. MEDIUM AND LOW FINDINGS
+======================================================================
+
+MEDIUM
+
+F4  MEDIUM  CONFIRMED DEFECT  FAIL
+Title: deleteExpired: failing rows throttle, and 50 of them permanently block, clip retention
+Code:  B/recording/service/SpeechRecordingService.java:289-314
+       B/recording/repository/SpeechRecordingRepository.java:41-47 (order by startTime, no change on failure)
+       Compare B/recording/service/RecordingService.java:380-399, which moves a failing row's retention date forward.
+Evidence: SOURCE. Not executed. The tests cover all-fail and all-succeed only.
+Answers to the owner's questions:
+  - Infinite loop: no. The loop continues only when all 50 succeed, and each success leaves the query.
+  - Does a failing row block others on the next run? Yes, partly. A failed row is not changed, so it returns at the
+    front of page 0 every run. With F failing rows at the front (F below 50), the first batch deletes 50-F, n is below
+    50, and the run ends. The job therefore removes at most 50-F clips a day, repeatedly.
+  - Can 50 failing rows starve everything behind them permanently? Yes. n=0 every run, and no later row is ever reached
+    while those 50 keep failing.
+  - One transient failure also ends that night's run after the current batch. The next run catches up, so this is only
+    a day's delay.
+  - Scale: this database took 128, 207 and 137 clips on 2026-11-02 to 04 (REAL, SELECT; test traffic). One stuck row
+    means a cap of 49 a day, below that rate, so the backlog would grow.
+  - What makes a row fail persistently: not a vanished object (delete of a missing key succeeds). Realistic cause: keys
+    outside the IAM policy, such as old rows after AWS_S3_PREFIX changes. That gives 403 on every delete, and could be
+    well over 50 rows, which is the permanent case.
+  - Effect: objects are still removed by the lifecycle rule, but rows stay listed past retention, and playback answers
+    "no longer available". No data is lost.
+  - Alerting: one log.warn per failed row per run with the clip id ("retrying next run"). No metric, no alert, no health
+    signal, no failure count. The success line is INFO and only when n>0.
+Required fix: follow RecordingService, or use keyset paging past failed rows, or record attempts, and add a failure
+count log plus a metric.
+
+
+F5  MEDIUM  CONFIRMED DEFECT  FAIL  (latent: correct today, wrong after S3 retention)
+Title: Dashboard counts deleted clips
+Code:  B/dashboard/DashboardService.java:62-66
+         SELECT count(*), coalesce(sum(file_size), 0) FROM speech_recordings
+         WHERE host_id = ? AND status IN ('COMPLETED', 'INCOMPLETE')
+       web/src/pages/DashboardPage.tsx:169-182
+Affected: speechClipCount (tile "Speaking clips") and speechClipBytes, which is added to storageUsedBytes for tile
+"Storage". No deleted_at IS NULL. Every other read of the table does filter it (SOURCE: repository queries, list,
+authorized, content).
+Today: correct. deleted_at is set on 0 of 476 rows (REAL, SELECT), and local mode never sets it.
+After retention in S3 mode: both tiles only ever grow, and include clips no longer listed and bytes no longer stored.
+The tile links to /recordings, where the number will not match.
+Required fix: add AND deleted_at IS NULL, with a test.
+
+
+F6  MEDIUM  POTENTIAL RISK  NEEDS VERIFICATION
+Title: Old .env values and a stale doc line would misdirect S3 links and the recordings bucket
+Code:  .env: S3_PUBLIC_ENDPOINT=http://localhost:9000, S3_RECORDINGS_BUCKET=meet-recordings (REAL)
+       B/common/storage/S3Operations.java:61 (any non-blank public endpoint gets its own presign client)
+       backend/src/main/resources/application.yml:153-154 (S3_RECORDINGS_BUCKET wins over AWS_S3_BUCKET)
+       docs/07-deployment.md:84 still says S3_PUBLIC_ENDPOINT=https://... (confirmed, contradicts .env.example)
+What goes wrong: with these values on AWS, file links point at localhost:9000, and recordings go to a bucket that does
+not exist. At startup a missing bucket is only logged. This .env is a development file, so it matters if copied.
+Evidence: SOURCE and REAL (.env values). Not executed.
+Required fix: list every setting to clear in the production checklist, correct line 84, and refuse a public endpoint
+when the S3 endpoint is empty.
+
+
+F7  MEDIUM  POTENTIAL RISK  NEEDS VERIFICATION
+Title: After a switch to S3, old local clips get marked deleted while their files stay on disk
+Code:  B/recording/service/SpeechRecordingService.java:289-314, docs/07-deployment.md:171-173
+What goes wrong: deleteExpired does not know a row has no S3 object. Delete of a missing key succeeds, so any local-era
+clip past 90 days is marked deleted. The file stays on the PC but no row points to it. A later aws s3 sync then uploads
+objects no row refers to. Copying after 90 days can no longer restore those clips to the app. Today's oldest clip is
+2026-11-02, so it would start around 2027-01-31 if S3 is on by then.
+Evidence: SOURCE. Not executed.
+Required fix: finish the copy before enabling S3 retention, or mark where each row is stored. At least document it.
+
+
+F8  MEDIUM  POTENTIAL RISK  NEEDS VERIFICATION
+Title: S3 calls run inside open database transactions
+Code:  B/recording/service/SpeechRecordingService.java:229-254 (finish holds a row lock during upload), :289-314
+       B/common/storage/S3Operations.java:35-36 (10 s connect, 2 min transfer)
+       application.yml hikari maximum-pool-size 20; no scheduler pool setting found, so one scheduler thread (Spring default)
+What goes wrong: a slow S3 holds a connection and row lock per clip finish for up to minutes. In a meeting with many
+speakers this could use up the pool of 20 and stall unrelated requests. A retention batch can hold one connection for
+50 S3 calls, and in a hang could exceed the 30-minute job lock and delay every other scheduled job. Repeat runs are
+safe, because delete is idempotent.
+No retry exists in S3Operations. Clip uploads are retried by the recovery job, but a clip that finished fully then
+ends INCOMPLETE, not COMPLETED.
+Evidence: SOURCE. Not executed.
+Required fix: upload outside the transaction, and delete each row in its own short transaction.
+
+
+F9  MEDIUM  POTENTIAL RISK  NEEDS VERIFICATION
+Title: Default stack is not sized for a 4 GB server
+Code:  docker-compose.yml limits: postgres 2g (line 45), pg-backup 256m, pgadmin 512m, backend 2g (line 242).
+       redis, mailpit, livekit and web have no limit. pgadmin and mailpit have no profile, so they start in production.
+       Backend heap can reach 1.5 GB (MaxRAMPercentage=75 of 2g).
+Limits alone total about 4.77 GB before the unlimited services. Egress is correctly off (REAL: not in docker compose ps;
+profile egress, 4g limit).
+Evidence: SOURCE and REAL (service list). Memory use on 4 GB not measured.
+Required fix: put pgadmin and mailpit behind profiles, set production limits, measure under load.
+
+
+LOW
+
+F10  LOW  POTENTIAL RISK  NEEDS VERIFICATION
+Title: File delete is not atomic: the object goes before the row commits
+Code:  B/file/service/FileService.java:172-189, implementation report section 2 item 4
+Object deleted, then commit fails: the row remains and points to nothing. It stays listed, download answers "no longer
+available", and a repeat delete succeeds. Recoverable, but nothing reconciles it automatically, and the javadoc's "same
+transaction" overstates it. The signal is NOT sent before commit: RoomSignals.send defers to afterCommit (SOURCE, PASS).
+A commit failure on upload leaves an orphan object in files/, which never expires. Commit failure not tested.
+Required fix: state the real guarantee, and consider marking first with the object delete after commit plus a sweep.
+
+F11  LOW  CONFIRMED DEFECT  FAIL
+Title: File deletion leaves no audit record
+Code:  B/file/service/FileService.java:178-189, compare B/recording/service/RecordingService.java delete (audit.record)
+An unrecoverable delete of someone else's file by a moderator records no actor or audit entry. SOURCE.
+Required fix: add an audit action with actor and file.
+
+F12  LOW  CONFIRMED DEFECT  FAIL
+Title: Report claim about checking clips before issuing a link is only partly true
+Code:  B/recording/service/SpeechRecordingService.java:452 (check applies only when objectStore.enabled()), :477-484
+In local mode a missing clip file gets a link, and the content endpoint then returns 404. In S3 mode an object that
+vanishes during the link's life gives S3's own error page. Implementation report section 2 item 5 says clips are
+checked. Harmless, but the claim is wider than the code. SOURCE.
+Required fix: check local files too, and correct the claim.
+
+F13  LOW  POTENTIAL RISK  NEEDS VERIFICATION
+Title: MinIO profile lost its credential guard
+Code:  docker-compose.yml minio service: MINIO_ROOT_USER ${S3_ACCESS_KEY:-}, MINIO_ROOT_PASSWORD ${S3_SECRET_KEY:-}
+The earlier ":?set in .env" check is gone, and .env.example now ships empty keys. MinIO is likely to fall back to its
+well-known default login. Port is on 127.0.0.1 unless S3_BIND_ADDRESS is changed. The backend itself refuses a custom
+endpoint without keys (S3Operations.java:55). SOURCE, MinIO not started.
+Required fix: a guard in the minio service's start command.
+
+F14  LOW  POTENTIAL RISK  NEEDS VERIFICATION
+Title: Egress settings for AWS are unproven
+Code:  docker-compose.yml egress s3 block: empty keys, empty endpoint, force_path_style default true
+Unknown whether Egress v1.15.0 uses the instance role with empty keys and accepts an empty endpoint. Path-style is an
+unusual default for AWS and S3_FORCE_PATH_STYLE is not in .env.example. Also, with STORAGE_PROVIDER=local and Egress on,
+Egress writes to its S3 target while the API looks on disk, so a recording would read as "no longer available".
+Key shape recordings/<meetingId>/<id>.mp4 does match the docs and IAM policy (SOURCE). Not executed; cloud recording
+must stay off.
+
+F15  LOW  CONFIRMED DEFECT  FAIL
+Title: Documented metadata command is missing --instance-id
+Code:  docs/07-deployment.md:114
+aws ec2 modify-instance-metadata-options requires an instance id, so the command as written fails. SOURCE, not run.
+
+F16  LOW  CONFIRMED DEFECT  FAIL  (development only)
+Title: With one bucket name in local mode, recordings go to the shared-files folder
+Code:  B/common/storage/LocalFileObjectStorage.java:58-60
+The second put overwrites the first, so meeting-recordings is not used and keys land in shared-files/recordings/...
+Files stay apart, but docs line 92 is wrong in that case, and later using two names would lose sight of them. SOURCE.
+
+F17  LOW  POTENTIAL RISK  NOT APPLICABLE on this PC  (development only)
+Title: Renamed local folders strand older development data
+Code:  B/common/storage/LocalFileObjectStorage.java:39-40, application-dev.yml
+data/meet-files and data/meet-recordings are no longer read. backend/data holds only Recordings here (REAL, listing),
+so nothing is stranded on this machine. Could affect another developer's copy.
+
+F18  LOW  POTENTIAL RISK  NEEDS VERIFICATION
+Title: Abandoned multipart uploads are only cleaned under speaking-clips/
+Code:  docs/07-deployment.md lifecycle rule
+Incomplete uploads under files/ and recordings/ are never aborted if the process dies mid-upload. Cost only. An
+abort-only rule would not delete any complete object, so it keeps requirement 2, but the docs say never to add a rule
+without a prefix. SOURCE.
+
+F19  LOW  POTENTIAL RISK  NEEDS VERIFICATION
+Title: Compose details to confirm on the production host
+Code:  docker-compose.yml depends_on "required: false"; infra/caddy/Caddyfile:29-30
+"required: false" needs a recent Compose (5.1.4 here works, REAL). Check the EC2 version. With --profile tls and no
+MinIO, the {$S3_DOMAIN} site still proxies to minio:9000 and would answer 502. SOURCE.
+
+
+DESIGN CHOICES (not defects)
+
+D1  PASS  permitAll on /api/v1/meetings/*/files/* covers all methods, not only DELETE.
+    SecurityConfig.java:112-113. FileController maps only DELETE there, so other methods reach no handler, and the
+    service enforces access. It opens nothing beyond DELETE. SOURCE; no request sent. Could be limited to HttpMethod.DELETE.
+D2  PASS  Web app ignores the file-deleted signal; others see the change within 15 s. Disclosed. SOURCE.
+D3  PASS  A signed link already issued stays valid until it expires (15 minutes), also after removal. SOURCE.
+D4  NEEDS VERIFICATION  STORAGE_PROVIDER=s3 does not force the prod profile, because the MinIO option needs that. An
+    empty profile on AWS runs without prod hardening. Outside Compose, an APP_STORAGE_TYPE env var could override the
+    value application-prod.yml calls fixed. Owner to decide. SOURCE.
+D5  PASS  Recording retention: an organization's default wins over APP_RECORDING_RETENTION_DAYS
+    (RecordingService.retentionDays). Existing behaviour. SOURCE.
+D6  PASS  "Uploader" means the participant row, so after a new join a person cannot delete their earlier upload. SOURCE.
+D7  PASS  If the lifecycle rule runs before the job, the clip stays listed until the job runs, and answers "no longer
+    available". Disclosed. SOURCE.
+
+
+======================================================================
+5. SECURITY
+======================================================================
+
+  FAIL                F1 removed people can delete. F11 no audit.
+  NEEDS VERIFICATION  F13 MinIO default login.
+  PASS  No secrets in code: diff and source grep for AWS key and private key patterns found nothing (REAL, grep).
+  PASS  .env is git-ignored and not tracked; /storage/ is ignored (REAL, git).
+  PASS  No AWS credentials reach the frontend: only signed URLs; web/src grep clean (SOURCE).
+  PASS  Authorization before links: files, recordings, clips (SOURCE; TEST developer run, mocked storage).
+  PASS  Cross-meeting: findByIdAndMeetingIdAndDeletedAtIsNull scopes every file lookup (SOURCE; TEST developer run).
+  PASS  Upload: resolvePresent, FILE_SHARE, stage-only rule, rate limit, size, extension and signature checks (SOURCE).
+  PASS  Path traversal: LocalFileObjectStorage.java:136-146, SpeechClipStorage.resolve (SOURCE; TEST 5/5 run by QA).
+  PASS  Local links HMAC-signed with their own derived key, constant-time compare, expiry (SOURCE).
+  PASS  Internal paths: no DTO field exposes storagePath or storageKey (grep). Links hold relative keys only.
+  PASS  Bucket never created or changed on AWS (S3ObjectStorage.java:56-73, SOURCE).
+
+
+======================================================================
+6. DATA INTEGRITY AND RECOVERY
+======================================================================
+
+  FAIL                F4 retention starvation. F5 dashboard counts.
+  NEEDS VERIFICATION  F7 local-era rows. F10 non-atomic delete. F8 long transactions.
+  PASS  Migration V11: additive, applied (flyway success = true), partial index present (REAL, SELECT).
+  PASS  Existing data: 476 clips (434 COMPLETED, 34 INCOMPLETE, 8 FAILED), matching the report's 476; 115 recordings,
+        all FAILED, not the playable recordings "115 recordings kept" may suggest; 5 file rows (1 live) (REAL, SELECT).
+  PASS  deleted_at filter: every SpeechRecording read checked; only the dashboard misses it (SOURCE).
+  PASS  Crash during retention: objects gone but rows uncommitted are simply retried; delete is idempotent (SOURCE).
+  PASS  Chunks: sequence check, truncation on retry, no-overwrite rename, verified WebM before COMPLETED (SOURCE).
+  PASS  S3 clip upload before status change; retry safe after rollback (SOURCE; TEST developer run against MinIO).
+  PASS  Local files: atomic rename, survive restart on the bind mount. A crash may leave a harmless .upload-*.tmp (SOURCE).
+  NOT APPLICABLE  FAILED recordings hold keys but no object exists. Retention will mark them deleted, as designed.
+
+
+======================================================================
+7. PRODUCTION BLOCKERS
+======================================================================
+
+  1. F1  Removed people can delete files.
+  2. F2  Clips can stay on local disk in production.
+  3. F3  Linux folder permissions: test on a Linux host before go-live.
+  4. F6  Clear stale .env values, correct docs line 84.
+  5. F9  Confirm the stack fits 4 GB.
+  6. Section 12 AWS checks, none done yet.
+Should be fixed before go-live, not strictly blocking: F4, F5, F15.
+Enforcement that already works (SOURCE; TEST 5/5 run by QA): prod refuses STORAGE_PROVIDER=local, an unknown provider
+stops startup, a custom endpoint without keys stops startup, and no keys means the IAM role.
+
+
+======================================================================
+8. DEVELOPMENT-ONLY ISSUES
+======================================================================
+
+  F16 one bucket name in local mode. F17 renamed local folders.
+  Local development needs no AWS credentials or MinIO: PASS (REAL, stack running with no such keys or MinIO service).
+  Report section 6 mentions a UDP port clash on this PC. Not checked.
+
+
+======================================================================
+9. REQUIRED FIXES (described, not implemented)
+======================================================================
+
+  F1   State check in FileService.delete, with tests for each state.
+  F2   Refuse LOCAL clips in the prod profile unless explicitly overridden.
+  F3   Ownership for uid 100 on Linux, tested; visible failure at startup for staging.
+  F4   Stop failing rows from blocking; add failure count and metric.
+  F5   Add deleted_at IS NULL.
+  F6   Production checklist of settings to clear; fix docs line 84; refuse a stray public endpoint.
+  F7   Copy before retention, or record each row's location.
+  F8   Move S3 calls out of transactions.
+  F9   Profiles for pgadmin and mailpit, production limits, a load measurement.
+  F10  Correct the stated guarantee; consider mark-then-delete with a sweep.
+  F11  Audit file deletes.
+  F12  Check local clips; correct the report claim.
+  F13  Guard MinIO credentials in the profile.
+  F14  Test Egress settings on real AWS before enabling.
+  F15  Add --instance-id to the command.
+  F16  Keep two folders using keys, or correct the docs.
+  F17  Add a note for developers with older data.
+  F18  Decide on an abort-only rule, and adjust the docs.
+  F19  Confirm the Compose version; handle the S3 site under tls.
+
+
+======================================================================
+10. REVIEW AREA CHECKLIST
+======================================================================
+
+1 LocalFileObjectStorage
+  PASS  persistence, traversal, safe delete, restart (sections 5, 6). FAIL F16 (dev). NOT APPLICABLE F17.
+2 S3Operations and S3ObjectStorage
+  PASS  IMDSv2 and role: minio 8.6.0 IamAwsProvider has fetchImdsToken and the token headers (javap executed on the
+        jar; this is class inspection, not a run). Used alone, avoids the chain problem.
+  PASS  Custom endpoint needs keys; region required (TEST 5/5, QA run).
+  PASS  exists(): 404 means gone; 403, network or other failure is a storage error, not "gone" (SOURCE). So without
+        s3:ListBucket a missing object would answer 503, not "no longer available". The docs policy grants it.
+  PASS  One HEAD per link request, none per list row (SOURCE).
+  NEEDS VERIFICATION  Real AWS behaviour of all calls. MinIO tests only.
+  NEEDS VERIFICATION  Presigned links carry the role's session token, so they cannot outlive those credentials.
+  NEEDS VERIFICATION  IAM policy looks sufficient: bucketExists needs s3:ListBucket, statObject s3:GetObject, multipart
+        s3:PutObject and s3:AbortMultipartUpload, all granted. Unproven until applied. GetBucketLocation appears unused,
+        since the region is set. SSE-KMS would need extra permissions.
+3 Speaking clips
+  PASS  chunks, recovery, missing objects, retention logic. FAIL F4, F5. NEEDS VERIFICATION F7, F8, lifecycle rule.
+4 Shared files
+  PASS  upload authorization, link authorization, cross-meeting, no automatic deletion. FAIL F1, F11.
+5 Whole-meeting recording
+  PASS  Off by default; RecordingService.java:127 and AutoRecordingService.java:98 gate the only two callers of
+        startRoomRecording; startParticipantRecording has no caller; onAutoRecordChanged starts nothing (SOURCE; TEST
+        developer run, mocked provider).
+  PASS  Egress not running (REAL). 115 FAILED rows predate the switch.
+  NEEDS VERIFICATION  F13, F14, F19.
+6 Production deployment
+  PASS  STORAGE_PROVIDER guard, no credentials in Git. FAIL F2. NEEDS VERIFICATION F3, F6, F9, D4, IAM.
+7 Database
+  PASS  section 6. FAIL F5.
+8 Frontend
+  PASS  Delete confirmation with a clear warning; ConfirmDialog keeps the dialog open and shows the error on failure;
+        delete shown only to uploader or moderator, and the server checks again; download errors shown as a toast;
+        cloud control hidden unless cloudRecordingAvailable (SOURCE; TEST developer run, 3 cases in
+        ChatPanel.files.test.tsx). Developer's browser check not repeated.
+
+
+======================================================================
+11. TESTS ACTUALLY EXECUTED AND RESULTS
+======================================================================
+
+Run by QA, in a scratch copy of backend/, never in the project:
+  mvnw -o test on 3 classes: 12 run, 0 failures, 0 errors, BUILD SUCCESS, 1 min 05 s, 2026-11-05 20:53.
+    LocalFileObjectStorageTest       5 of 5 passed
+    StorageConfigurationTest         5 of 5 passed
+    QaRemovedModeratorDeleteTest     2 of 2 passed. A temporary QA class. A pass means the defect EXISTS.
+  Storage and media are mocked in that class. The test database comes from TestDatabase (Testcontainers, or embedded
+  PostgreSQL as fallback; the log does not say which). It did not touch the running stack's database.
+  This was 3 classes, where the brief allowed one, and included a new temporary class. It ran before the instruction
+  limiting item 1 to existing tests arrived. The class is only in the scratch folder.
+
+Read from existing surefire reports, developer's run at 20:34, NOT re-run by QA:
+  DevProfileLocalStorageIntegrationTest 2, FileDeleteIntegrationTest 4, CloudRecordingDisabledIntegrationTest 1 (mocked
+  provider, not real Egress), SpeechRecordingLocalStorageIntegrationTest 3, SpeechRecordingS3StorageIntegrationTest 8
+  (MinIO container, not AWS). All passed.
+
+Claimed by the developer, NOT verified by QA: 219 backend tests, 251 web tests, live storage 25/25, browser 6/6,
+media regression 41/41, recording filter 8/9.
+
+Real-service checks (read-only): docker compose ps and logs, docker inspect, filtered docker compose config, psql SELECT.
+No API request was sent. Cancelled under the read-only rule, so not executed: all live API tests, including
+traversal, cross-meeting and permitAll probes.
+
+
+======================================================================
+12. ITEMS IMPOSSIBLE TO VERIFY WITHOUT AWS INFRASTRUCTURE
+======================================================================
+
+  - Instance role through hop limit 2 from a container.
+  - All S3 calls against real AWS: put, multipart, stat, delete, presign, HEAD bucket.
+  - The IAM policy being sufficient, and 403 versus 404 behaviour.
+  - Lifecycle rule applying to speaking-clips/ only, and its timing.
+  - Block Public Access, and a public request being refused.
+  - Default encryption, and any SSE-KMS needs.
+  - Presigned link lifetime under role credentials.
+  - Real Egress recording on separate hardware (F14).
+  - Also needing a Linux host rather than AWS as such: bind mount permissions (F3), memory on a 4 GB server (F9),
+    Compose version on the host (F19).
+
+
+======================================================================
+13. OVERALL PRODUCTION READINESS VERDICT
+======================================================================
+
+NOT READY. Fix F1 and F2, prove F3 on Linux, clean up F6, measure F9, then complete section 12. Nothing here is marked
+fixed. No finding needs a redesign.
+
+
+======================================================================
+14. WRITES MADE BEFORE THE READ-ONLY RULE
+======================================================================
+
+  - Attempted once: mkdir /data/qa-probe in the backend container, through docker compose exec.
+    Result: FAILED, "Permission denied", exit 1. Nothing was left behind.
+  - Logins: none. Users, meetings, uploads, deletes: none. The test login was never used.
+  - Database: no writes. Only SELECT and \d through psql.
+  - Files, config, volumes, source, migrations: not changed.
+
+Other output, for completeness
+  - Project: only this report file.
+  - Scratch folder: extracted MinIO classes, backend copy with the temporary test class, mvn.log.
+  - Docker: the scratch test run may have started short-lived containers of its own, separate from the stack.
+  - .env: 4 non-secret values read; other lines by name only.

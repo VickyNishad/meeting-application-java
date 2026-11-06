@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { Track, type Participant } from 'livekit-client';
 import { speechRecordingsApi } from '@/lib/api/endpoints';
 import { useSpeakingIndicator } from './speaking';
-import { ALWAYS_HEARD, measureVoice, type VoiceGate } from './voiceGate';
+import { ALWAYS_HEARD, VoiceMonitor, type VoiceGate } from './voiceGate';
 
 /**
  * A speaking turn ends after this much silence: shorter pauses stay in the same clip, longer ones start a new one.
@@ -199,23 +199,53 @@ export function useSpeechRecorder(opts: {
   const previousClip = useRef<Promise<void>>(Promise.resolve());
   // One audio engine for measuring this participant's voice level, kept for the whole meeting.
   const audio = useRef<AudioContext | null>(null);
+  // Listens to the microphone all the time, so that a clip can count the voice from just before it started.
+  const monitor = useRef<{ track: MediaStreamTrack; voice: VoiceMonitor } | null>(null);
   useEffect(
     () => () => {
+      monitor.current?.voice.stop();
+      monitor.current = null;
       void audio.current?.close().catch(() => undefined);
       audio.current = null;
     },
     [],
   );
-  const voiceGateFor = useCallback((track: MediaStreamTrack): VoiceGate => {
-    if (typeof AudioContext === 'undefined') return ALWAYS_HEARD;
-    try {
-      audio.current ??= new AudioContext();
-      if (audio.current.state === 'suspended') void audio.current.resume().catch(() => undefined);
-      return measureVoice(track, audio.current);
-    } catch {
-      return ALWAYS_HEARD;
-    }
+  const monitorOf = useCallback((track: MediaStreamTrack): VoiceMonitor => {
+    if (monitor.current?.track === track) return monitor.current.voice;
+    monitor.current?.voice.stop();
+    audio.current ??= new AudioContext();
+    if (audio.current.state === 'suspended') void audio.current.resume().catch(() => undefined);
+    const voice = new VoiceMonitor(track, audio.current);
+    monitor.current = { track, voice };
+    return voice;
   }, []);
+  const voiceGateFor = useCallback(
+    (track: MediaStreamTrack): VoiceGate => {
+      if (typeof AudioContext === 'undefined') return ALWAYS_HEARD;
+      try {
+        return monitorOf(track).gate();
+      } catch {
+        return ALWAYS_HEARD;
+      }
+    },
+    [monitorOf],
+  );
+
+  // The microphone track can change during a meeting (another device, or turned off and on): follow it.
+  useEffect(() => {
+    if (!enabled || !participant || typeof AudioContext === 'undefined') return;
+    const follow = () => {
+      const track = participant.getTrackPublication(Track.Source.Microphone)?.track?.mediaStreamTrack;
+      try {
+        if (track) monitorOf(track);
+      } catch {
+        // Not measurable: clips are then treated as voice.
+      }
+    };
+    follow();
+    const timer = setInterval(follow, 1000);
+    return () => clearInterval(timer);
+  }, [enabled, participant, monitorOf]);
 
   useEffect(() => {
     if (!enabled || !speaking || !participant || typeof MediaRecorder === 'undefined') return;

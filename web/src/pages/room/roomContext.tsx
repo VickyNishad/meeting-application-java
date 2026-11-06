@@ -28,6 +28,7 @@ export interface MeetingRoomState {
   setHand: (identity: string, raised: boolean) => void;
   waitingCount: number;
   cloudRecording: boolean;
+  cloudRecordingAvailable: boolean;
   setCloudRecording: (v: boolean) => void;
   /** participantId → display name of participants recording locally. */
   localRecorders: Record<string, string>;

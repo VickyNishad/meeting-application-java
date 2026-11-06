@@ -62,7 +62,7 @@ class DevProfileLocalStorageIntegrationTest {
         assertThat(storage).isInstanceOf(LocalFileObjectStorage.class);
         byte[] body = "0123456789".getBytes(StandardCharsets.UTF_8);
         storage.put("meet-recordings", "recordings/m/r.mp4", new ByteArrayInputStream(body), body.length, "video/mp4");
-        assertThat(ROOT.resolve("meet-recordings/recordings/m/r.mp4")).hasBinaryContent(body);
+        assertThat(ROOT.resolve("meeting-recordings/recordings/m/r.mp4")).hasBinaryContent(body);
 
         String playback = path(storage.presignGet("meet-recordings", "recordings/m/r.mp4", Duration.ofMinutes(5), null));
         mvc.perform(get(URI.create(playback)))

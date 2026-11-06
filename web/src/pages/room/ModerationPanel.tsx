@@ -71,6 +71,11 @@ function WaitingList() {
   );
 }
 
+function CloudRecordingSection() {
+  const { cloudRecordingAvailable } = useMeetingRoom();
+  return cloudRecordingAvailable ? <CloudRecording /> : null;
+}
+
 function CloudRecording() {
   const { meeting, join, cloudRecording, setCloudRecording, stageOnly } = useMeetingRoom();
   const [layout, setLayout] = useState<'grid' | 'speaker'>('speaker');
@@ -299,7 +304,7 @@ export function ModerationPanel({ onClose }: { onClose: () => void }) {
             </SettingRow>
           </div>
         </Section>
-        <CloudRecording />
+        <CloudRecordingSection />
       </div>
     </PanelChrome>
   );

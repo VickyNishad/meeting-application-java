@@ -144,6 +144,19 @@ describe('room state store: QA fixes', () => {
     expect(s.stale).toBe(false);
   });
 
+  it('counts a deleted-file signal like any other numbered one', () => {
+    let s = loaded({ seq: 10 });
+    s = roomReducer(s, signal('files', { type: 'file-deleted', fileId: 'f1', stream: 'all', seq: 11 }));
+    expect(s.seq).toBe(11);
+    expect(s.stale).toBe(false);
+  });
+
+  it('offers cloud recording only when the snapshot says this server has a recorder', () => {
+    expect(loaded({}).cloudRecordingAvailable).toBe(false);
+    expect(loaded({ cloudRecordingAvailable: false }).cloudRecordingAvailable).toBe(false);
+    expect(loaded({ cloudRecordingAvailable: true }).cloudRecordingAvailable).toBe(true);
+  });
+
   it('never lets an older snapshot undo a signal received while reloading (QA-F7)', () => {
     let s = loaded({ seq: 5 });
     s = roomReducer(s, signal('hand', { type: 'hand', participantId: 'a', displayName: 'Ann', raised: true, stream: 'all', seq: 7 }));

@@ -78,6 +78,10 @@ public class SpeechRecording extends BaseEntity {
     @Column(name = "chunks_received", nullable = false)
     private int chunksReceived;
 
+    /** Set once the clip's object is gone (retention): the row stays as a record, the clip is no longer listed or played. */
+    @Column(name = "deleted_at")
+    private Instant deletedAt;
+
     @Column(name = "last_chunk_at")
     private Instant lastChunkAt;
 
@@ -118,6 +122,15 @@ public class SpeechRecording extends BaseEntity {
     @PreUpdate
     void onUpdate() {
         updatedAt = Instant.now();
+    }
+
+    public void markDeleted(Instant now) {
+        deletedAt = now;
+        updatedAt = now;
+    }
+
+    public boolean isDeleted() {
+        return deletedAt != null;
     }
 
     public void chunkStored(long newSize, Instant now) {

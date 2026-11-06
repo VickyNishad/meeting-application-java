@@ -1,0 +1,231 @@
+ENVIRONMENT-BASED FILE STORAGE (LOCAL DEVELOPMENT + AWS S3 PRODUCTION)
+Implementation report, 5 November 2026, corrected and extended 6 November 2026 (section 9)
+Status: implemented and tested locally, not verified on real AWS. Not ready for production. Nothing committed or pushed.
+
+
+1. RESULT
+
+STORAGE_PROVIDER now chooses where everything is kept.
+  local   Files and recordings on disk, clips on disk. No AWS account or MinIO needed.
+  s3      One private bucket with prefixes, reached through the EC2 instance role.
+
+Compose now starts React, Java, LiveKit, PostgreSQL and Redis. MinIO and Egress start only on request
+(--profile minio, --profile egress). MinIO has not been removed.
+
+NOT TESTED AGAINST REAL SERVICES
+  - No test ran against real AWS S3 or a real IAM role. S3 tests used a MinIO container.
+  - No test ran against real Egress. Cloud recording is off, and tests that start it use a mocked provider.
+  - The lifecycle rule and the IAM policy in docs/07-deployment.md have never been applied to a real bucket.
+These must be checked on the AWS account before going live (section 7).
+
+
+2. YOUR 7 CONDITIONS
+
+1. 90-day rule on speaking clips only
+   Done. The documented rule filters on the prefix speaking-clips/. The application cannot change it: its
+   IAM policy has no lifecycle permission. Not yet applied to a real bucket.
+2. Shared files never deleted automatically
+   Done. No job or rule touches files/. A file goes only when its uploader or a host deletes it.
+3. Whole-meeting recording retention separate
+   Done. APP_RECORDING_RETENTION_DAYS stays separate from APP_SPEECH_CLIP_RETENTION_DAYS.
+4. Database and S3 stay consistent
+   PARTIAL (corrected 6 November). The object is deleted first, then the row is marked. If storage fails the row
+   stays and the job retries. QA found gaps: F4 and F5 are fixed, F7 and F10 are open.
+   Rows hold relative keys, so they do not depend on a server name. Migration V11 adds speech_recordings.deleted_at.
+5. Expired or missing objects handled gracefully
+   Done, with a limit (corrected 6 November). Files, recordings and S3 clips are checked before a link is issued and
+   answer "no longer available". Local clips are not checked in advance: a missing file is reported on playback.
+6. Cloud recording off by default
+   Done. APP_CLOUD_RECORDING_ENABLED=false hides the control, refuses manual starts with a clear message, skips
+   automatic starts, and leaves no failed rows. Speaking clips carry on.
+7. MinIO not removed until migrated
+   Done. MinIO stays as an optional profile, and docker/minio was not touched. The io.minio Java library stays
+   by decision 1: it is the S3 client, used only in S3Operations.java and pom.xml.
+
+
+3. WHAT CHANGED
+
+Backend
+  - S3Operations.java (new): the one place that talks to S3, on AWS or a compatible server.
+    Empty keys use the IAM role. A custom endpoint without keys stops at startup.
+  - MinioObjectStorage renamed to S3ObjectStorage. On AWS it never creates or changes a bucket.
+  - LocalFileObjectStorage: folders are now shared-files and meeting-recordings; one bucket name for both works.
+  - ObjectStorage gained exists().
+  - Speaking clips: retention job at 03:45, S3 only, 50 at a time. Local clips are never removed.
+  - New endpoint: DELETE /api/v1/meetings/{id}/files/{fileId}, for the uploader or a moderator.
+
+Frontend
+  - Delete button with confirmation in Chat > Files, for the uploader and moderators.
+  - Cloud recording section hidden in Host controls when the server has no recorder.
+
+Configuration and docs
+  - docker-compose.yml, .env.example, .gitignore (/storage/), README-Docker.md, docs/06-security.md and
+    docs/07-deployment.md (bucket setup, IAM policy, lifecycle rule, instance metadata hop limit 2, Egress).
+
+Security rules
+  - No keys in code or Git. A scan of the diff for AWS keys and private keys found nothing.
+  - Browsers only get short-lived signed links, issued after the API has checked access.
+  - Local development works with no AWS credentials.
+
+
+4. DIFFERENCES FROM THE APPROVED PLAN
+
+Simpler than planned
+  - ObjectStorage keeps its bucket parameters rather than moving to logical areas. A HashMap and one-bucket
+    keys fix the crash with far less change.
+  - Clips keep SpeechClipObjectStore on top of S3Operations, because their mode is set separately and the
+    existing S3 tests rely on it.
+  - LiveKitMediaAdapter and the Caddyfile did not change.
+
+Added, not in the plan (please review)
+  - prod now refuses to start with STORAGE_PROVIDER=local. Without this, Compose's default would have sent
+    files to a MinIO that is not running and kept clips on disk, failing only at the first upload.
+  - .env.example now defaults to the development setup: SPRING_PROFILES_ACTIVE= (empty) and STORAGE_PROVIDER=local.
+    The old prod value would now stop at startup, and it also forced Secure cookies on plain HTTP.
+  - S3_ACCESS_KEY and S3_SECRET_KEY are empty in the example, because AWS uses the role.
+
+
+5. TEST EVIDENCE
+
+Backend: ./mvnw -B verify
+  219 run, 0 failures, 0 errors, 1 skipped. BUILD SUCCESS, 2 min 19 s.
+  The skipped test is the existing LiveKitMediaAdapterLiveTest.
+  S3 integration tests ran against a MinIO container, not AWS.
+
+Web: npx vitest run, npm run lint, npx tsc -b
+  34 files, 251 passed. tsc exit 0, lint printed no errors.
+  One note: the lint exit code was read through a pipe, so it rests on the empty output.
+  The first run had 3 failures in the new test only (jsdom lacks scrollIntoView). The test was fixed, not the app.
+
+Compose: docker compose config
+  Your .env: 8 services, no MinIO or Egress, STORAGE_PROVIDER=local.
+  Production values: S3_ENDPOINT empty, keys empty, both buckets the same, clips set to s3.
+  With both profiles on: minio and egress present.
+
+Live stack: docker compose up -d --build with your .env
+  Started with local storage. Migration V11 applied. Only the RTC port range was changed, for this run (section 6).
+
+Live storage test (real HTTP and real disk): 25 of 25 passed
+  Upload and identical download; tampered signature, altered expiry and path traversal refused; blocked type
+  refused; hostile file name cleaned; guests still cannot upload; no access without credentials; no access or
+  delete through another meeting; other users and forged ids cannot delete; uploader and host can delete;
+  old links stop working; a file removed from disk gives a friendly 404; cloud start refused with no row left.
+
+Browser test (Chromium): 6 of 6 passed
+  Delete button shown, confirmation shown, file leaves the panel, API agrees, no cloud recording control.
+  Screenshots reviewed.
+
+Regression, media permissions (Chromium and real LiveKit): 41 of 41 passed.
+
+Regression, recording filter (Chromium and real LiveKit): 8 of 9 passed.
+  The one failure is expected. Check 6 asserts that speech starts a cloud recording. With cloud recording off
+  it found no row, which is the required behaviour. An attempted edit to this check did not apply, so the
+  original assertion ran and is reported as it ran. The speaking guest's 2 clips were stored.
+
+
+6. WHAT YOU SHOULD KNOW
+
+  - Your .env is unchanged, but plain "docker compose up" may fail on this PC: another program holds UDP 51045,
+    inside your 51000-51100 range. I used LIVEKIT_RTC_PORT_START=53000 and LIVEKIT_RTC_PORT_END=53100 as
+    temporary variables for this run.
+  - Other participants see a deleted file disappear within 15 seconds, on the list refresh. New files behave the
+    same way. The server sends a file-deleted signal, but the web app does not use it yet. If someone clicks
+    a deleted file before the refresh, they get "no longer available".
+  - A clip whose object vanished stays listed until retention removes it, and shows the friendly error.
+  - On a MinIO setup, set RECORDING_STORAGE_TYPE=LOCAL. Clips use AWS S3 or local disk only.
+  - Keep APP_SPEECH_CLIP_RETENTION_DAYS and the lifecycle rule equal. If the rule is shorter, clips stay listed
+    but unavailable until the job runs.
+  - Test data in the local database: 2 users (qast-*@meet.local), meetings titled STORAGE_LIVE, STORAGE_UI,
+    PERM_E2E and similar, 4 clips, and 5 file rows (4 deleted, plus vanishes.txt, which is the missing-file test).
+    One test row was edited by hand: those 2 users were marked as e-mail verified.
+  - Your data is safe: 115 recordings kept, clips grew from 472 to 476, volumes and docker/minio untouched.
+  - AWS_LINUX_DEPLOYMENT_REQUIREMENTS_REPORT.txt section 9 is out of date on the Egress cause. It was not edited.
+
+
+7. CHECKS STILL NEEDED ON AWS
+
+  1. Create the private bucket and attach the instance role with hop limit 2.
+  2. Apply the lifecycle rule and confirm it shows only speaking-clips/.
+  3. Set STORAGE_PROVIDER=s3, SPRING_PROFILES_ACTIVE=prod, AWS_REGION, AWS_S3_BUCKET and an empty S3_ENDPOINT=.
+  4. Test upload, download, delete and clip playback in a browser against the real bucket.
+  5. Confirm a public request to an object is refused.
+
+
+8. LATER, EACH NEEDING YOUR APPROVAL
+
+  - Removing MinIO from Compose and deleting docker/minio.
+  - The ICE investigation.
+  - A separate Egress worker, after a capacity assessment.
+  - Copying existing clips to S3 (they stay on the PC for now).
+
+
+9. QA REMEDIATION PHASE 1 (6 November 2026)
+
+Sections 1 to 8 are the report of 5 November. Their test evidence stands as a record of that date and was not rerun
+or rewritten. Only the status line and conditions 4 and 5 in section 2 were corrected. The independent review is in
+STORAGE_ARCHITECTURE_QA_REPORT.txt.
+
+Corrections to the 5 November report
+  - Condition 5 said every clip is checked before a link is issued. That holds only in S3 mode. A local clip is not
+    checked in advance; a missing file is reported when it is played.
+  - Condition 4 was marked Done, but QA failed it. F4 and F5 are now fixed. F7 and F10 remain open, so it is PARTIAL.
+
+Status of the fixes
+  F1   PASS  A removed or denied person cannot delete. A moderator must be in the meeting now.
+  F2   PASS  prod refuses local clips and local files, checked on the final settings. There is no override.
+  F4   PASS  A failing clip no longer blocks the clips behind it.
+  F5   PASS  Deleted clips are left out of the dashboard count and bytes.
+  F6   PASS  Wrong production S3 settings stop startup. Docs and examples corrected.
+  F15  PASS  The command now has --instance-id. It has not been run against AWS.
+
+What each result rests on
+  Implemented and tested locally (real stack, local storage)
+    F1 rules, upload, download, clip playback, dashboard counts, cloud recording off.
+  Real container startup (no AWS call made)
+    prod refused all four bad settings in the backend image.
+  Tested against MinIO (container), not AWS
+    F4 retention: failing rows, backlog, recovery, time limit, and only clips being touched.
+  Tested against real AWS
+    Nothing.
+  Not yet verified
+    Everything in section 7, Linux (F3), 4 GB memory (F9), real Egress (F14).
+    The Prometheus name meet_speech_clips_retention_total: the test reads the counter, the name was not scraped.
+
+Design decisions
+  F1  Standing is checked across all of a signed-in user's rows. A new session makes a new row, so a person removed
+      on one row could otherwise have used an older LEFT row. A removed person gets the
+      same 403 whether or not the file exists.
+  F2  prod with an S3-compatible server is still possible for files, but clips only go to AWS S3.
+  F4  Paging by position (start time, then id) needs no migration, so no schema changed. A failed clip is simply
+      tried again on the next nightly run. There is no backoff and no stored failure count.
+      One run stops after 20 minutes, below its 30-minute lock, so an outage cannot run past the lock.
+  F6  Found during this work: application.yml defaulted S3_PUBLIC_ENDPOINT to http://localhost:9000 outside Compose.
+      The default is now empty. On AWS, S3_FILES_BUCKET and S3_RECORDINGS_BUCKET must match AWS_S3_BUCKET.
+
+Evidence, 6 November
+  ./mvnw -B verify                    261 run, 0 failures, 0 errors, 1 skipped (LiveKitMediaAdapterLiveTest). BUILD SUCCESS.
+  Focused classes                     67 run, 0 failures, 0 errors, 0 skipped.
+  Negative control, scratch copy      Bugs put back for F1, F2, F4, F5, F6: 56 run, 10 failed, as intended. Copy deleted.
+  Web vitest                          34 files, 251 passed. Lint exit 0, tsc exit 0. No frontend code changed in Phase 1.
+  docker compose config               Development and production values both correct, 8 services.
+  Live recording filter               9 of 9. Check 6 now asserts that no cloud row is created.
+  Live storage test                   All passed (same 25 checks as section 5).
+  Live Phase 1 test                   20 of 20.
+  Browser test                        All passed (same 6 checks as section 5).
+  Dashboard against the database      412 clips and 64,042,561 bytes on both sides. No rows are deleted locally, so the
+                                      exclusion itself is proven by the automated test, not this comparison.
+  Media permissions                   First run 35 of 41. Rerun alone 41 of 41 in 96 s.
+    The first run was disturbed: the backend log has no entries for about 5 hours in the middle of it, tokens last
+    15 minutes, and every failure came after the first 401. Windows sleep events came back empty, so sleep is the
+    likely cause but is not proven.
+
+Known limitations
+  - A guest's rows in different sessions cannot be linked. A guest promoted to co-host who uploaded in one session
+    and was removed in a later one could still use the older row's secret to delete that file.
+  - The web app only offers delete in the room, so someone who has left can delete their file through the API only.
+  - Other participants still see a deleted file disappear within 15 seconds.
+  - Open from QA, not in this phase: F3, F7, F8, F9, F10, F11, F12, F13, F14, F16, F17, F18, F19.
+
+Further test data in the local database
+  Meetings titled P1_F1_ACTIVE, P1_F1_REMOVED, P1_F1_ENDED, P1_CLOUD, STORAGE_LIVE and similar, plus their file rows
+  and clips from the regression runs.

@@ -4,12 +4,16 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
 
-/** S3-compatible private object storage. Objects are only ever exposed through short-lived presigned URLs. */
+/** Private object storage (AWS S3, S3-compatible server, local disk). Objects are only exposed through short-lived signed URLs. */
 public interface ObjectStorage {
 
     void put(String bucket, String key, InputStream content, long size, String contentType);
 
+    /** Deleting an object that is already gone is not an error. */
     void delete(String bucket, String key);
+
+    /** False when the object is gone (e.g. expired by a lifecycle rule). A storage failure throws instead. */
+    boolean exists(String bucket, String key);
 
     /**
      * @param downloadFileName when non-null the URL forces {@code Content-Disposition: attachment}

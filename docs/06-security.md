@@ -29,7 +29,10 @@
 - [ ] `SPRING_PROFILES_ACTIVE=prod` (forces `APP_COOKIE_SECURE=true`, `APP_OPENAPI_ENABLED=false`, `APP_REQUIRE_EMAIL_VERIFICATION=true`).
 - [ ] Set `APP_METRICS_SCRAPE_PASSWORD` (Prometheus scrapes with HTTP Basic `prometheus:<password>`). The web nginx serves only `/actuator/health*` and returns 404 for every other `/actuator/` path.
 - [ ] The API (8080) and MinIO (9000/9001) are not published beyond loopback; all browser traffic enters through nginx/Caddy.
-- [ ] Never commit runtime data: `docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings` are git-ignored (a database dump holds user e-mails and password hashes).
+- [ ] Never commit runtime data: `docker/backups`, `docker/redis`, `docker/minio`, `docker/Recordings`, `storage` are git-ignored (a database dump holds user e-mails and password hashes).
 - [ ] Restrict LiveKit's HTTP API (7880) to the API servers, except the WebSocket signalling path for clients.
 - [ ] Enable encryption at rest for PostgreSQL volumes and the object store; bucket policies private.
+- [ ] S3 bucket: Block Public Access on, no public policy, access through the EC2 instance role with the least-privilege policy in `07-deployment.md`, no AWS keys in `.env` or Git, and no AWS credentials ever sent to the browser.
+- [ ] Every download link is signed and short-lived (`STORAGE_PRESIGN_TTL`), and is issued only after the API has checked the caller's access to that meeting.
+- [ ] The 90-day lifecycle rule targets `speaking-clips/` only; no rule applies to `files/` or `recordings/`.
 - [ ] Recording consent wording reviewed by legal for each jurisdiction served, including the automatic-recording notice on the join page ("By joining you agree to be recorded").

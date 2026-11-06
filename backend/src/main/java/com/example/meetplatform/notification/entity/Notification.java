@@ -108,12 +108,18 @@ public class Notification extends BaseEntity {
         return n;
     }
 
+    /** The one-time link of an e-mail, for its HTML version. Wiped with the body if the e-mail is sensitive. */
+    public void setLink(String link) {
+        this.link = link;
+    }
+
     public void markSent(Instant now) {
         status = Status.SENT;
         sentAt = now;
         attempts++;
         if (sensitive) {
             // One-time links must not linger in the outbox once delivered.
+            link = null;
             body = "[redacted after delivery]";
         }
     }
@@ -125,6 +131,7 @@ public class Notification extends BaseEntity {
             status = Status.FAILED;
             if (sensitive) {
                 body = "[redacted]";
+                link = null;
             }
         } else {
             scheduledAt = nextAttempt;

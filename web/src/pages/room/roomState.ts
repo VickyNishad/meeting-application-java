@@ -22,6 +22,7 @@ export interface RoomState {
   screenSharePolicy: ScreenSharePolicy;
   waitingRoomEnabled: boolean;
   cloudRecording: boolean;
+  cloudRecordingAvailable: boolean;
   /** participantId → display name. */
   localRecorders: Record<string, string>;
   /** participantId → display name. */
@@ -81,6 +82,8 @@ export function initialRoomState(meeting: Meeting, join: JoinResponse, myName?: 
     participantMedia: {},
     // Known from the join response for everyone, guests included, until the snapshot arrives.
     cloudRecording: !!join.meeting.recordingInProgress,
+    // Offered only once the server has said so, so the control never flashes on a server without a recorder.
+    cloudRecordingAvailable: false,
     localRecorders: {},
     raisedHands: {},
     roleOverrides: {},
@@ -113,6 +116,7 @@ function fromSnapshot(state: RoomState, v: RoomStateView): RoomState {
     screenSharePolicy: v.screenSharePolicy,
     waitingRoomEnabled: v.waitingRoomEnabled,
     cloudRecording: v.cloudRecording,
+    cloudRecordingAvailable: v.cloudRecordingAvailable ?? false,
     localRecorders: byId(v.localRecorders),
     raisedHands: byId(v.raisedHands),
     // The snapshot's roles are current: earlier overrides are folded into stageIdentities/role.

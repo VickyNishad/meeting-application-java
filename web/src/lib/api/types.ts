@@ -299,6 +299,8 @@ export interface RoomStateView {
   screenSharePolicy: ScreenSharePolicy;
   waitingRoomEnabled: boolean;
   cloudRecording: boolean;
+  /** False when this server has no recorder: the control is not offered. */
+  cloudRecordingAvailable?: boolean;
   autoRecord: boolean;
   localRecorders: RoomActor[];
   raisedHands: RoomActor[];
@@ -377,6 +379,8 @@ export interface FileMeta {
   contentType: string;
   sizeBytes: number;
   uploadedBy: string;
+  /** With the moderators, the one person who may delete it. */
+  uploadedByParticipantId?: string | null;
   createdAt: string;
 }
 

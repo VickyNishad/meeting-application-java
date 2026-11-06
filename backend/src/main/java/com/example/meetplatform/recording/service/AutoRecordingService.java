@@ -95,6 +95,9 @@ public class AutoRecordingService {
     @EventListener
     @Transactional(propagation = Propagation.MANDATORY)
     public void onSpeechDetected(MeetingEvents.SpeechDetected event) {
+        if (!properties.recording().cloudEnabled()) {
+            return;
+        }
         UUID participantId = event.participantId();
         AfterCommit.run(() -> {
             try {

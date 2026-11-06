@@ -77,20 +77,20 @@ public class NotificationListeners {
     @EventListener
     public void onVerification(IdentityEvents.EmailVerificationRequested e) {
         String link = properties.publicUrl() + "/verify-email?token=" + encode(e.rawToken());
-        notifications.email(e.userId(), e.email(), TYPE_VERIFY, "Verify your e-mail address",
+        notifications.emailWithLink(e.userId(), e.email(), TYPE_VERIFY, "Verify your e-mail address",
                 "Hi " + e.displayName() + ",\n\nConfirm your e-mail address to finish creating your account:\n" + link
                         + "\n\nThis link expires in " + properties.auth().emailVerificationTtl().toHours()
-                        + " hours. If you did not sign up, ignore this message.", null, true, e.userId());
+                        + " hours. If you did not sign up, ignore this message.", link, true, e.userId());
     }
 
     @EventListener
     public void onPasswordReset(IdentityEvents.PasswordResetRequested e) {
         String link = properties.publicUrl() + "/reset-password?token=" + encode(e.rawToken());
-        notifications.email(e.userId(), e.email(), TYPE_RESET, "Reset your password",
+        notifications.emailWithLink(e.userId(), e.email(), TYPE_RESET, "Reset your password",
                 "Hi " + e.displayName() + ",\n\nUse this link to choose a new password:\n" + link
                         + "\n\nIt expires in " + properties.auth().passwordResetTtl().toMinutes()
                         + " minutes. If you did not ask for this, you can ignore it; your password is unchanged.",
-                null, true, e.userId());
+                link, true, e.userId());
     }
 
     @EventListener

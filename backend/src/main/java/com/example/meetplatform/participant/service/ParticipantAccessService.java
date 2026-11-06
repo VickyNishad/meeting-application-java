@@ -66,6 +66,16 @@ public class ParticipantAccessService {
         return participant;
     }
 
+    /**
+     * Whether this participation still counts: it was admitted, and was not denied or removed. For a signed-in user
+     * every row is looked at, because a new session gets a new row and a later removal revokes the earlier ones.
+     */
+    @Transactional(readOnly = true)
+    public boolean inGoodStanding(MeetingParticipant participant) {
+        return participant.wasAdmitted() && (participant.getUserId() == null
+                || participants.wasAdmitted(participant.getMeetingId(), participant.getUserId()));
+    }
+
     /** Same as {@link #resolve} but additionally requires the participant to be in the live session. */
     @Transactional(readOnly = true)
     public MeetingParticipant resolvePresent(UUID meetingId, UUID participantId, String participantToken,

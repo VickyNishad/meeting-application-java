@@ -1,16 +1,6 @@
 package com.example.meetplatform.recording.service;
 
-import com.example.meetplatform.common.exception.ApiException;
-import com.example.meetplatform.common.exception.ErrorCode;
-import io.minio.BucketExistsArgs;
-import io.minio.GetPresignedObjectUrlArgs;
-import io.minio.MinioClient;
-import io.minio.UploadObjectArgs;
-import io.minio.credentials.IamAwsProvider;
-import io.minio.credentials.Provider;
-import io.minio.credentials.StaticProvider;
-import io.minio.http.Method;
-import okhttp3.OkHttpClient;
+import com.example.meetplatform.common.storage.S3Operations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -43,13 +33,11 @@ import java.util.Map;
 public class SpeechClipObjectStore {
 
     private static final Logger log = LoggerFactory.getLogger(SpeechClipObjectStore.class);
-    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
-    private static final Duration TRANSFER_TIMEOUT = Duration.ofMinutes(2);
 
     private final boolean enabled;
     private final String bucket;
     private final String prefix;
-    private final MinioClient client;
+    private final S3Operations s3;
 
     public SpeechClipObjectStore(@Value("${app.speech-recordings.storage-type:}") String storageType,
                                  @Value("${app.speech-recordings.s3.region:}") String region,
@@ -68,48 +56,24 @@ public class SpeechClipObjectStore {
         if (!type.equals("LOCAL") && !type.equals("S3")) {
             throw new IllegalStateException("RECORDING_STORAGE_TYPE must be LOCAL or S3, not '" + storageType + "'");
         }
+        if (production && type.equals("LOCAL")) {
+            throw new IllegalStateException("RECORDING_STORAGE_TYPE=LOCAL cannot be used with the prod profile: speaking "
+                    + "clips would stay on this server's disk and never expire. Clear RECORDING_STORAGE_TYPE, or leave "
+                    + "SPRING_PROFILES_ACTIVE empty for local development.");
+        }
         this.enabled = type.equals("S3");
         this.bucket = bucket;
         this.prefix = normalizePrefix(prefix);
         if (!enabled) {
-            if (production) {
-                log.warn("Production profile with RECORDING_STORAGE_TYPE=LOCAL: speaking clips stay on this server's "
-                        + "disk. Set RECORDING_STORAGE_TYPE=S3 to keep them in AWS S3.");
-            }
-            this.client = null;
+            this.s3 = null;
             return;
         }
         if (isBlank(region) || isBlank(bucket)) {
             throw new IllegalStateException("RECORDING_STORAGE_TYPE=S3 needs AWS_REGION and AWS_S3_BUCKET");
         }
-        Provider credentials = credentials(accessKey, secretKey);
-        this.client = MinioClient.builder()
-                .endpoint(isBlank(endpoint) ? "https://s3." + region + ".amazonaws.com" : endpoint)
-                // Set explicitly so presigning is a pure local computation (no region lookup round-trip).
-                .region(region)
-                .credentialsProvider(credentials)
-                // The upload runs inside the finish transaction: fail fast instead of OkHttp's 5-minute defaults.
-                .httpClient(new OkHttpClient.Builder()
-                        .connectTimeout(CONNECT_TIMEOUT)
-                        .writeTimeout(TRANSFER_TIMEOUT)
-                        .readTimeout(TRANSFER_TIMEOUT)
-                        .build())
-                .build();
+        this.s3 = new S3Operations(endpoint, "", region, accessKey, secretKey, "Recording storage is unavailable.");
         log.info("Speaking clips are uploaded to s3://{}/{} ({} credentials)", bucket, this.prefix,
-                credentials instanceof StaticProvider ? "access-key" : "IAM role");
-    }
-
-    /**
-     * Access keys when both are configured (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), otherwise the server's IAM
-     * role: EC2 instance profile (IMDS), ECS task role or EKS web identity. The IAM provider is used on its own: in a
-     * ChainedProvider, MinIO's AwsEnvironmentProvider throws (not ProviderException) when the keys are unset or empty,
-     * which would stop the chain before the IAM role is ever tried.
-     */
-    static Provider credentials(String accessKey, String secretKey) {
-        if (!isBlank(accessKey) && !isBlank(secretKey)) {
-            return new StaticProvider(accessKey, secretKey, null);
-        }
-        return new IamAwsProvider(null, null);
+                isBlank(accessKey) || isBlank(secretKey) ? "IAM role" : "access-key");
     }
 
     /** True when finished clips go to S3 (the local folder is then staging only). */
@@ -124,7 +88,7 @@ public class SpeechClipObjectStore {
             return;
         }
         try {
-            if (!client.bucketExists(BucketExistsArgs.builder().bucket(bucket).build())) {
+            if (!s3.bucketExists(bucket)) {
                 log.error("Speaking-clip bucket {} does not exist; clips stay RECORDING until it does", bucket);
             }
         } catch (Exception e) {
@@ -137,27 +101,25 @@ public class SpeechClipObjectStore {
      * just writes the same object again.
      */
     public void upload(String relativePath, Path file, String contentType) {
-        try {
-            client.uploadObject(UploadObjectArgs.builder()
-                    .bucket(bucket).object(key(relativePath)).filename(file.toString()).contentType(contentType).build());
-        } catch (Exception e) {
-            throw new ApiException(ErrorCode.STORAGE_UNAVAILABLE, "Recording storage is unavailable.", e);
-        }
+        s3.upload(bucket, key(relativePath), file, contentType);
+    }
+
+    /** False when the object is gone, e.g. expired by the bucket's lifecycle rule. */
+    public boolean exists(String relativePath) {
+        return s3.exists(bucket, key(relativePath));
+    }
+
+    /** Removes the clip's object; one already gone (a lifecycle rule got there first) is not an error. */
+    public void delete(String relativePath) {
+        s3.delete(bucket, key(relativePath));
     }
 
     /** A presigned GET for the clip: inline for playback, attachment for download, with the clip's own file name. */
     public String presignGet(String relativePath, String fileName, String contentType, boolean download, Duration ttl) {
         String encoded = URLEncoder.encode(fileName, StandardCharsets.UTF_8).replace("+", "%20");
-        try {
-            return client.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
-                    .method(Method.GET).bucket(bucket).object(key(relativePath)).expiry((int) ttl.toSeconds())
-                    .extraQueryParams(Map.of(
-                            "response-content-disposition", (download ? "attachment" : "inline") + "; filename*=UTF-8''" + encoded,
-                            "response-content-type", contentType))
-                    .build());
-        } catch (Exception e) {
-            throw new ApiException(ErrorCode.STORAGE_UNAVAILABLE, "Recording storage is unavailable.", e);
-        }
+        return s3.presignGet(bucket, key(relativePath), ttl, Map.of(
+                "response-content-disposition", (download ? "attachment" : "inline") + "; filename*=UTF-8''" + encoded,
+                "response-content-type", contentType));
     }
 
     /** The object key: the optional prefix plus the clip's relative path, always with '/' separators. */

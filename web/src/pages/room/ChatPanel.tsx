@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Download, FileUp, Loader2, MessageSquare, Paperclip, Send } from 'lucide-react';
+import { Download, FileUp, Loader2, MessageSquare, Paperclip, Send, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
+import { ConfirmDialog } from '@/components/common';
 import { Button } from '@/components/ui/button';
 import { Avatar, Input } from '@/components/ui/primitives';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/overlays';
 import { chatApi } from '@/lib/api/endpoints';
 import { errorMessage } from '@/lib/api/problem';
+import type { FileMeta } from '@/lib/api/types';
 import { formatTime } from '@/lib/time';
 import { cn, formatBytes } from '@/lib/utils';
 import { useMeetingRoom } from './roomContext';
@@ -120,9 +122,10 @@ function Messages({ chat }: { chat: MeetingChat }) {
 }
 
 function Files() {
-  const { meeting, join } = useMeetingRoom();
+  const { meeting, join, isModerator } = useMeetingRoom();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
+  const [deleting, setDeleting] = useState<FileMeta | null>(null);
   const q = useQuery({ queryKey: ['meeting-files', meeting.id], queryFn: () => chatApi.files(meeting.id, join.waitToken), refetchInterval: 15_000 });
   const upload = useMutation({
     mutationFn: (file: File) => chatApi.upload(meeting.id, join.participantId, file, join.waitToken),
@@ -139,6 +142,11 @@ function Files() {
     } catch (e) {
       toast.error(errorMessage(e));
     }
+  };
+  const remove = async (fileId: string) => {
+    await chatApi.deleteFile(meeting.id, fileId, join.participantId, join.waitToken);
+    toast.success('File deleted');
+    void qc.invalidateQueries({ queryKey: ['meeting-files', meeting.id] });
   };
   return (
     <div className="space-y-3 p-4">
@@ -175,9 +183,22 @@ function Files() {
             <Button size="icon" variant="ghost" className="text-neutral-200 hover:bg-white/10" aria-label={`Download ${f.fileName}`} onClick={() => void download(f.id)}>
               <Download aria-hidden="true" />
             </Button>
+            {(isModerator || f.uploadedByParticipantId === join.participantId) && (
+              <Button size="icon" variant="ghost" className="text-neutral-200 hover:bg-white/10" aria-label={`Delete ${f.fileName}`} onClick={() => setDeleting(f)}>
+                <Trash2 aria-hidden="true" />
+              </Button>
+            )}
           </li>
         ))}
       </ul>
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(o) => !o && setDeleting(null)}
+        title={`Delete ${deleting?.fileName ?? 'this file'}?`}
+        description="It is removed for everyone in this meeting and cannot be recovered."
+        confirmLabel="Delete"
+        onConfirm={() => (deleting ? remove(deleting.id) : undefined)}
+      />
     </div>
   );
 }

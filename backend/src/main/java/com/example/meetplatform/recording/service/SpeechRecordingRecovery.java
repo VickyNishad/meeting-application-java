@@ -52,4 +52,18 @@ public class SpeechRecordingRecovery {
             }
         });
     }
+
+    /** Daily: speaking clips past their retention (S3 storage only). */
+    @Scheduled(cron = "${app.speech-recordings.retention-cron:0 45 3 * * *}")
+    public void enforceRetention() {
+        jobLock.runExclusively("speech-recording-retention", Duration.ofMinutes(30), () -> {
+            SpeechRecordingService.RetentionRun run = service.deleteExpired();
+            if (run.failed() > 0 || run.skipped() > 0) {
+                log.warn("Speaking clip retention: {} removed, {} failed, {} skipped; these are tried again on the next run",
+                        run.deleted(), run.failed(), run.skipped());
+            } else if (run.deleted() > 0) {
+                log.info("Speaking clip retention: {} removed", run.deleted());
+            }
+        });
+    }
 }

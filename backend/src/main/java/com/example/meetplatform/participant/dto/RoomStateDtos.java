@@ -36,7 +36,7 @@ public final class RoomStateDtos {
                                 boolean cloudRecording, boolean autoRecord, List<Actor> localRecorders,
                                 List<Actor> raisedHands, Integer waitingCount, List<Actor> participants,
                                 int presentCount, MediaPermissionsView mediaPermissions, ParticipantMedia myMedia,
-                                List<ParticipantMedia> participantMedia) {
+                                List<ParticipantMedia> participantMedia, boolean cloudRecordingAvailable) {
     }
 
     /** The meeting-wide media permissions for participants (hosts and co-hosts may always publish). */

@@ -93,6 +93,15 @@ class RecordingAccessIntegrationTest extends AbstractIntegrationTest {
         mvc.perform(get("/api/v1/recordings").header("Authorization", attendee.bearer()))
                 .andExpect(jsonPath("$.items[?(@.id == '" + recordingId + "')]").exists());
 
+        // Its object is gone (removed outside the application): a clear answer, not a link to a storage error page.
+        when(storage.exists(anyString(), anyString())).thenReturn(false);
+        mvc.perform(post("/api/v1/recordings/" + recordingId + "/playback-url").header("Authorization", host.bearer()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.detail").value("This recording's file is no longer available."));
+        mvc.perform(post("/api/v1/recordings/" + recordingId + "/download-url").header("Authorization", host.bearer()))
+                .andExpect(status().isNotFound());
+        when(storage.exists(anyString(), anyString())).thenReturn(true);
+
         // Admin endpoints are restricted to system administrators.
         mvc.perform(get("/api/v1/admin/stats").header("Authorization", host.bearer())).andExpect(status().isForbidden());
         mvc.perform(get("/api/v1/admin/stats").header("Authorization", admin.bearer())).andExpect(status().isOk());

@@ -4,6 +4,9 @@ app:
     # Tests control recovery explicitly.
     recovery-interval: PT24H
   public-url: http://localhost:5173
+  recording:
+    # On for the recording tests; off by default in every real environment.
+    cloud-enabled: true
   security:
     jwt-secret: test-only-secret-0123456789-abcdefghijklmnopqrstuvwxyz
     cookie-secure: false

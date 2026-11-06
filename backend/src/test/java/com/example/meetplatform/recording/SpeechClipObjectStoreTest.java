@@ -47,8 +47,9 @@ class SpeechClipObjectStoreTest {
         // Production without a bucket does not silently fall back to local disk: startup stops.
         assertThatThrownBy(() -> new SpeechClipObjectStore("", "", "", "", "", "", "", prod))
                 .hasMessageContaining("AWS_S3_BUCKET");
-        // An explicit LOCAL is still honoured in production (a warning is logged).
-        assertThat(new SpeechClipObjectStore("LOCAL", "", "", "", "", "", "", prod).enabled()).isFalse();
+        // An explicit LOCAL is refused in production: clips would stay on the server and never expire.
+        assertThatThrownBy(() -> new SpeechClipObjectStore("LOCAL", "", "", "", "", "", "", prod))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("RECORDING_STORAGE_TYPE=LOCAL");
     }
 
     @Test
